@@ -1,0 +1,23 @@
+name: Docker Image Build
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t go-mumble-server:${GITHUB_SHA::7} .
+
+      - name: Export image
+        run: docker save go-mumble-server:${GITHUB_SHA::7} | gzip > go-mumble-server.tar.gz
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: go-mumble-server-image
+          path: go-mumble-server.tar.gz
