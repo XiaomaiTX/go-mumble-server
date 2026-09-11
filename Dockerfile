@@ -24,17 +24,17 @@ FROM debian:bookworm-slim
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates openssl \
+    ca-certificates curl gosu openssl \
     && rm -rf /var/lib/apt/lists/*
 
-RUN groupadd -r mumble && useradd -r -g mumble -d /data mumble
+RUN groupadd -r -g 999 mumble && useradd -r -u 999 -g 999 -d /data -s /usr/sbin/nologin mumble
 
 COPY --from=builder /app/go-mumble-server ./
 COPY configs/mumble-server.toml ./mumble-server.toml
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
 RUN mkdir -p /data && chown mumble:mumble /data
-
-USER mumble
 
 ENV MUMBLE_DATABASE_PATH=/data/mumble-server.sqlite
 ENV MUMBLE_NETWORK_HOST=0.0.0.0
@@ -45,5 +45,5 @@ EXPOSE 64730/tcp
 
 VOLUME ["/data"]
 
-ENTRYPOINT ["./go-mumble-server"]
+ENTRYPOINT ["docker-entrypoint.sh"]
 CMD ["-config", "mumble-server.toml"]

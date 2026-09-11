@@ -128,6 +128,38 @@ Use `-timeout=30s` to avoid hanging. For race detection: `CGO_ENABLED=1 go test 
 MUMBLE_MUMBLE_PORT=64738 MUMBLE_REST_PORT=64730 ./go-mumble-server
 ```
 
+## Docker Deployment
+
+Build the image and run it with Docker Compose:
+
+```yaml
+services:
+  go-mumble-server:
+    image: go-mumble-server:latest   # build with: docker build -t go-mumble-server:latest .
+    ports:
+      - "64738:64738/tcp"
+      - "64738:64738/udp"
+      - "64730:64730/tcp"
+    environment:
+      MUMBLE_DATABASE_PATH: /data/mumble-server.sqlite
+    volumes:
+      - ./mumble-data:/data          # bind mount, or use a named volume instead
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:64730/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+```
+
+Notes:
+
+- The image starts as root, fixes `/data` ownership, then drops privileges to the built-in `mumble` user (UID/GID 999). Bind-mounted data directories work out of the box regardless of the host directory's owner.
+- On images built before this behavior existed (≤ commit `f5e651f`), fix a bind-mounted data directory manually:
+  `mkdir -p mumble-data && sudo chown 999:999 mumble-data` — or switch to a named volume.
+- The healthcheck uses `curl`, which is included in the image, and hits the `/health` REST endpoint (port 64730).
+
 ## Home Assistant Add-on
 
 You can run go-mumble-server as a [Home Assistant add-on](https://www.home-assistant.io/addons/). Add this repository in Home Assistant:
