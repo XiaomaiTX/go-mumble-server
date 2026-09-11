@@ -315,11 +315,12 @@ type VoiceTarget struct {
 }
 
 type VoiceTargetTarget struct {
-	Session   []uint32
-	ChannelID uint32
-	Group     string
-	Links     bool
-	Children  bool
+	HasChannelID bool // 区分未指定频道与显式指定根频道 0。
+	Session      []uint32
+	ChannelID    uint32
+	Group        string
+	Links        bool
+	Children     bool
 }
 
 func (m *VoiceTarget) Marshal() ([]byte, error) {
@@ -334,9 +335,10 @@ func (m *VoiceTarget) Marshal() ([]byte, error) {
 			tb = wire.AppendTag(tb, 1, wire.WireVarint)
 			tb = wire.AppendVarint(tb, uint64(s))
 		}
-		// Always write channel_id (root is 0)
-		tb = wire.AppendTag(tb, 2, wire.WireVarint)
-		tb = wire.AppendVarint(tb, uint64(t.ChannelID))
+		if t.HasChannelID || t.ChannelID != 0 {
+			tb = wire.AppendTag(tb, 2, wire.WireVarint)
+			tb = wire.AppendVarint(tb, uint64(t.ChannelID))
+		}
 		if t.Group != "" {
 			tb = wire.AppendString(tb, 3, t.Group)
 		}
@@ -378,7 +380,9 @@ func (m *VoiceTarget) Unmarshal(data []byte) error {
 			}
 			b = b[n:]
 			var t VoiceTargetTarget
-			t.unmarshal(tb)
+			if err := t.unmarshal(tb); err != nil {
+				return err
+			}
 			m.Targets = append(m.Targets, t)
 		default:
 			skip, err := wire.SkipField(b, wt)
@@ -414,6 +418,7 @@ func (t *VoiceTargetTarget) unmarshal(data []byte) error {
 			}
 			b = b[n:]
 			t.ChannelID = uint32(v)
+			t.HasChannelID = true
 		case 3:
 			s, n, err := wire.ReadLengthDelimited(b)
 			if err != nil {

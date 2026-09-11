@@ -41,7 +41,7 @@ type Server struct {
 	conns           map[uint32]*connection.Conn
 	addrBySession   sync.Map // session -> net.Addr
 	sessionByAddr   sync.Map // addr.String() -> uint32 sessionID
-	voiceTargets    sync.Map // session -> map[targetID][]session
+	voiceTargets    sync.Map // session -> map[targetID]voiceTargetSpec；由 connMu 保护更新
 	textRateLimiter sync.Map // session -> *rateWindow
 	// userStateRateLimiter throttles self-targeted UserState, which murmur also
 	// rate-limits because each accepted message fans out to every client.
@@ -254,7 +254,15 @@ func (s *Server) SendAudio(sessionID uint32, packet []byte) error {
 	c, ok := s.conns[sessionID]
 	recipientAddr, _ := s.addrBySession.Load(sessionID)
 	s.connMu.RUnlock()
-	if !ok || c == nil {
+	if !ok {
+		return nil
+	}
+	return s.sendAudioTo(sessionID, c, recipientAddr, packet)
+}
+
+// sendAudioTo 使用已固定的连接和地址，发送时不再按可复用的 session 查找。
+func (s *Server) sendAudioTo(sessionID uint32, c *connection.Conn, recipientAddr interface{}, packet []byte) error {
+	if c == nil {
 		if s.voiceDebug.Load() {
 			slog.Warn("[VOICE-DEBUG] SendAudio: recipient conn not found", "recipient", sessionID)
 		}
@@ -323,18 +331,6 @@ func (s *Server) audioFilterRecipient(senderSessionID, recipientSessionID uint32
 		return false
 	}
 	return !vs.Deaf && !vs.SelfDeaf
-}
-
-func (s *Server) getVoiceTargetRecipients(sessionID uint32, targetID uint8) []uint32 {
-	v, ok := s.voiceTargets.Load(sessionID)
-	if !ok {
-		return nil
-	}
-	m, ok := v.(map[uint8][]uint32)
-	if !ok {
-		return nil
-	}
-	return m[targetID]
 }
 
 // UpdateChannelCrypto recomputes the aggregate crypto mode string for a channel.
@@ -443,8 +439,8 @@ func NewServer(cfg *config.Config, db *gorm.DB, serverID uint, udpConn net.Packe
 			}
 			return cid
 		},
-		GetUsersInChan: s.users.SessionIDsInChannel,
-		GetVoiceTarget: s.getVoiceTargetRecipients,
+		GetUsersInChan:   s.users.SessionIDsInChannel,
+		RouteVoiceTarget: s.routeVoiceTarget,
 		GetLinkedChans: func(cid uint32) []uint32 {
 			ids := s.chans.LinkedChannelIDs(cid)
 			if len(ids) <= 1 {
@@ -689,8 +685,8 @@ func (s *Server) UnregisterConn(sessionID uint32) {
 	}
 	s.connMu.Lock()
 	delete(s.conns, sessionID)
+	s.removeVoiceTargetsLocked(sessionID)
 	s.connMu.Unlock()
-	s.voiceTargets.Delete(sessionID)
 	s.addrBySession.Delete(sessionID)
 	s.textRateLimiter.Delete(sessionID)
 	s.userStateRateLimiter.Delete(sessionID)
@@ -1864,51 +1860,7 @@ func (s *Server) handleVoiceTarget(msgType protocol.MessageType, payload []byte,
 	if vt.ID == 0 || vt.ID > 30 {
 		return nil
 	}
-	var recipients []uint32
-	seen := make(map[uint32]bool)
-	for _, t := range vt.Targets {
-		for _, sid := range t.Session {
-			if !seen[sid] {
-				seen[sid] = true
-				recipients = append(recipients, sid)
-			}
-		}
-		addChannel := func(channelID uint32) {
-			for _, sid := range s.users.SessionIDsInChannel(channelID) {
-				if !seen[sid] {
-					seen[sid] = true
-					recipients = append(recipients, sid)
-				}
-			}
-		}
-		addChannel(t.ChannelID)
-		if t.Children {
-			cid := t.ChannelID
-			if cid == 0 {
-				if cur, ok := s.users.ChannelID(c.SessionID()); ok {
-					cid = cur
-				}
-			}
-			for _, subID := range s.chans.SubtreeIDs(cid) {
-				addChannel(subID)
-			}
-		}
-		if t.Links {
-			if ch, ok := s.chans.GetChannel(t.ChannelID); ok {
-				for _, lid := range ch.Links {
-					addChannel(lid)
-				}
-			}
-		}
-	}
-	merged := make(map[uint8][]uint32)
-	if v, ok := s.voiceTargets.Load(c.SessionID()); ok {
-		for k, val := range v.(map[uint8][]uint32) {
-			merged[k] = val
-		}
-	}
-	merged[uint8(vt.ID)] = recipients
-	s.voiceTargets.Store(c.SessionID(), merged)
+	s.storeVoiceTarget(c, vt)
 	return nil
 }
 

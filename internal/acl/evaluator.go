@@ -1,6 +1,7 @@
 package acl
 
 import (
+	"strings"
 	"sync"
 
 	"github.com/dchote/go-mumble-server/internal/channel"
@@ -341,4 +342,27 @@ func (e *Evaluator) defaultRootPerms(userID uint32) uint32 {
 		p |= uint32(mumble.PermissionWrite)
 	}
 	return p
+}
+
+// CheckCurrent 不使用权限缓存，确保私密语音基于当前频道、ACL 和令牌计算。
+func (e *Evaluator) CheckCurrent(subject Subject, channelID uint32, perm mumble.Permission) bool {
+	p := e.evaluate(subject, channelID)
+	return p&uint32(mumble.PermissionWrite) != 0 || p&uint32(perm) == uint32(perm)
+}
+
+// InGroup 按接收者的当前状态检查 Whisper 的组筛选条件。
+func (e *Evaluator) InGroup(u mumble.User, channelID uint32, group string) bool {
+	invert := strings.HasPrefix(group, "!")
+	group = strings.TrimPrefix(group, "!")
+	group = strings.TrimPrefix(group, "~")
+	var match bool
+	if strings.HasPrefix(group, "#") {
+		match = e.userHasToken(&u, strings.TrimPrefix(group, "#"))
+	} else {
+		match = e.userInGroup(u.UserID, group, channelID, u.ChannelID, &u)
+	}
+	if invert {
+		return !match
+	}
+	return match
 }

@@ -334,11 +334,12 @@ var schemaFieldMap = map[string]map[string]string{
 		"Targets": "targets",
 	},
 	"VoiceTargetTarget": {
-		"Session":   "session",
-		"ChannelID": "channel_id",
-		"Group":     "group",
-		"Links":     "links",
-		"Children":  "children",
+		"HasChannelID": "", // 仅记录 channel_id 的存在性，无独立线字段。
+		"Session":      "session",
+		"ChannelID":    "channel_id",
+		"Group":        "group",
+		"Links":        "links",
+		"Children":     "children",
 	},
 	"PermissionQuery": {
 		"ChannelID":   "channel_id",

@@ -13,14 +13,15 @@ type RecipientSender interface {
 
 // RouterConfig configures the audio router.
 type RouterConfig struct {
-	Sender          RecipientSender
-	GetChan         func(sessionID uint32) uint32
-	GetUsersInChan  func(channelID uint32) []uint32
-	GetVoiceTarget  func(sessionID uint32, targetID uint8) []uint32
-	GetLinkedChans  func(channelID uint32) []uint32
-	FilterRecipient func(senderSessionID, recipientSessionID uint32) bool
-	CanSenderSpeak  func(senderSessionID uint32) bool
-	VoiceDebug      bool
+	Sender           RecipientSender
+	GetChan          func(sessionID uint32) uint32
+	GetUsersInChan   func(channelID uint32) []uint32
+	GetVoiceTarget   func(sessionID uint32, targetID uint8) []uint32
+	RouteVoiceTarget func(sessionID uint32, targetID uint8, packet []byte) error
+	GetLinkedChans   func(channelID uint32) []uint32
+	FilterRecipient  func(senderSessionID, recipientSessionID uint32) bool
+	CanSenderSpeak   func(senderSessionID uint32) bool
+	VoiceDebug       bool
 }
 
 // Router forwards voice packets to appropriate recipients.
@@ -104,6 +105,9 @@ func (r *Router) Route(senderSessionID uint32, voiceTarget uint8, decryptedPacke
 			slog.Warn("[VOICE-DEBUG] Route: GetChan or GetUsersInChan is nil")
 		}
 	default:
+		if voiceTarget >= 1 && voiceTarget <= 30 && cfg.RouteVoiceTarget != nil {
+			return cfg.RouteVoiceTarget(senderSessionID, voiceTarget, decryptedPacket)
+		}
 		if voiceTarget >= 1 && voiceTarget <= 30 && cfg.GetVoiceTarget != nil {
 			recipients = cfg.GetVoiceTarget(senderSessionID, voiceTarget)
 		}
