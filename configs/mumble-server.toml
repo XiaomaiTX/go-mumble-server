@@ -61,6 +61,9 @@ register_name = "go-mumble-server"
 # local 用于独立部署；external 用于外部身份提供者，且不会回退本地认证。
 mode = "local"
 external_url = ""
+# Provider endpoint 路径可独立配置，不与某个身份系统的路由结构绑定。
+authenticate_path = "/api/internal/mumble/v1/authenticate"
+resolve_path = "/api/internal/mumble/v1/identities/resolve"
 service_token = ""
 server_instance_id = "voice-server-01"
 timeout_ms = 1500

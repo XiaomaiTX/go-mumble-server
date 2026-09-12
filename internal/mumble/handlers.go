@@ -434,6 +434,7 @@ func NewServer(cfg *config.Config, db *gorm.DB, serverID uint, udpConn net.Packe
 	if strings.EqualFold(cfg.AuthMode, "external") {
 		s.authority, s.authorityErr = identity.NewExternalHTTPAuthority(identity.ExternalHTTPConfig{
 			BaseURL: cfg.ExternalAuthURL, ServiceToken: cfg.ExternalAuthServiceToken,
+			AuthenticatePath: cfg.ExternalAuthAuthenticatePath, ResolvePath: cfg.ExternalAuthResolvePath,
 			Timeout: cfg.ExternalAuthTimeout, CACertPath: cfg.ExternalAuthCACertPath,
 			ClientCertPath: cfg.ExternalAuthClientCertPath, ClientKeyPath: cfg.ExternalAuthClientKeyPath,
 		})

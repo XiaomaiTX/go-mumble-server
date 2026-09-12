@@ -23,18 +23,22 @@ var (
 )
 
 type ExternalHTTPConfig struct {
-	BaseURL        string
-	ServiceToken   string
-	Timeout        time.Duration
-	CACertPath     string
-	ClientCertPath string
-	ClientKeyPath  string
+	BaseURL          string
+	AuthenticatePath string
+	ResolvePath      string
+	ServiceToken     string
+	Timeout          time.Duration
+	CACertPath       string
+	ClientCertPath   string
+	ClientKeyPath    string
 }
 
 type ExternalHTTPAuthority struct {
-	baseURL string
-	token   string
-	client  *http.Client
+	baseURL          string
+	authenticatePath string
+	resolvePath      string
+	token            string
+	client           *http.Client
 }
 
 func NewExternalHTTPAuthority(cfg ExternalHTTPConfig) (*ExternalHTTPAuthority, error) {
@@ -45,6 +49,18 @@ func NewExternalHTTPAuthority(cfg ExternalHTTPConfig) (*ExternalHTTPAuthority, e
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = 1500 * time.Millisecond
 	}
+	if cfg.AuthenticatePath == "" {
+		cfg.AuthenticatePath = "/api/internal/mumble/v1/authenticate"
+	}
+	if cfg.ResolvePath == "" {
+		cfg.ResolvePath = "/api/internal/mumble/v1/identities/resolve"
+	}
+	if err := validateEndpointPath(cfg.AuthenticatePath); err != nil {
+		return nil, fmt.Errorf("invalid external authenticate path: %w", err)
+	}
+	if err := validateEndpointPath(cfg.ResolvePath); err != nil {
+		return nil, fmt.Errorf("invalid external resolve path: %w", err)
+	}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	tlsConfig, err := externalTLSConfig(cfg)
 	if err != nil {
@@ -52,9 +68,11 @@ func NewExternalHTTPAuthority(cfg ExternalHTTPConfig) (*ExternalHTTPAuthority, e
 	}
 	transport.TLSClientConfig = tlsConfig
 	return &ExternalHTTPAuthority{
-		baseURL: baseURL,
-		token:   strings.TrimSpace(cfg.ServiceToken),
-		client:  &http.Client{Timeout: cfg.Timeout, Transport: transport},
+		baseURL:          baseURL,
+		authenticatePath: cfg.AuthenticatePath,
+		resolvePath:      cfg.ResolvePath,
+		token:            strings.TrimSpace(cfg.ServiceToken),
+		client:           &http.Client{Timeout: cfg.Timeout, Transport: transport},
 	}, nil
 }
 
@@ -98,7 +116,7 @@ func (a *ExternalHTTPAuthority) Authenticate(ctx context.Context, req Authentica
 		IdentityVersion uint64   `json:"identity_version"`
 		PolicyVersion   uint64   `json:"policy_version"`
 	}
-	if err := a.post(ctx, "/internal/mumble/v1/authenticate", req, &response); err != nil {
+	if err := a.post(ctx, a.authenticatePath, req, &response); err != nil {
 		return AuthenticateResult{}, err
 	}
 	if strings.EqualFold(response.Decision, string(DecisionDeny)) {
@@ -125,7 +143,7 @@ func (a *ExternalHTTPAuthority) Resolve(ctx context.Context, req ResolveRequest)
 			PolicyVersion   uint64   `json:"policy_version"`
 		} `json:"identities"`
 	}
-	if err := a.post(ctx, "/internal/mumble/v1/identities/resolve", req, &response); err != nil {
+	if err := a.post(ctx, a.resolvePath, req, &response); err != nil {
 		return nil, err
 	}
 	identities := make([]Identity, 0, len(response.Identities))
@@ -139,6 +157,16 @@ func (a *ExternalHTTPAuthority) Resolve(ctx context.Context, req ResolveRequest)
 		identities = append(identities, identity)
 	}
 	return identities, nil
+}
+
+func validateEndpointPath(path string) error {
+	if path == "" || path[0] != '/' || strings.HasPrefix(path, "//") {
+		return errors.New("must be an absolute-path reference beginning with one slash")
+	}
+	if strings.ContainsAny(path, "?#") {
+		return errors.New("query strings and fragments are not allowed")
+	}
+	return nil
 }
 
 func validateExternalIdentity(identity Identity) error {

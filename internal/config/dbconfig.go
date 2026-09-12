@@ -157,6 +157,8 @@ func ConfigForServer(meta *MetaConfig, server *ServerConfigData, bootstrap *Conf
 		cfg.FrontendEmbed = bootstrap.FrontendEmbed
 		cfg.AuthMode = bootstrap.AuthMode
 		cfg.ExternalAuthURL = bootstrap.ExternalAuthURL
+		cfg.ExternalAuthAuthenticatePath = bootstrap.ExternalAuthAuthenticatePath
+		cfg.ExternalAuthResolvePath = bootstrap.ExternalAuthResolvePath
 		cfg.ExternalAuthServiceToken = bootstrap.ExternalAuthServiceToken
 		cfg.ExternalAuthServerInstanceID = bootstrap.ExternalAuthServerInstanceID
 		cfg.ExternalAuthTimeout = bootstrap.ExternalAuthTimeout

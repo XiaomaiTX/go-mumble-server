@@ -44,6 +44,8 @@ type Config struct {
 	MaxImageMessageLength        int
 	AuthMode                     string
 	ExternalAuthURL              string
+	ExternalAuthAuthenticatePath string
+	ExternalAuthResolvePath      string
 	ExternalAuthServiceToken     string
 	ExternalAuthServerInstanceID string
 	ExternalAuthTimeout          time.Duration
@@ -93,6 +95,8 @@ type fileConfig struct {
 	Auth struct {
 		Mode                      string `toml:"mode"`
 		ExternalURL               string `toml:"external_url"`
+		AuthenticatePath          string `toml:"authenticate_path"`
+		ResolvePath               string `toml:"resolve_path"`
 		ServiceToken              string `toml:"service_token"`
 		ServerInstanceID          string `toml:"server_instance_id"`
 		TimeoutMS                 int    `toml:"timeout_ms"`
@@ -122,13 +126,15 @@ func defaults() *Config {
 		ChannelDepth:  10,
 		ChannelCount:  1000,
 		// Murmur's defaults for the same settings.
-		AllowRecording:         true,
-		MaxTextMessageLength:   5000,
-		MaxImageMessageLength:  131072,
-		AuthMode:               "local",
-		ExternalAuthTimeout:    1500 * time.Millisecond,
-		ExternalAuthRevalidate: 45 * time.Second,
-		ExternalAuthStaleGrace: 3 * time.Minute,
+		AllowRecording:               true,
+		MaxTextMessageLength:         5000,
+		MaxImageMessageLength:        131072,
+		AuthMode:                     "local",
+		ExternalAuthAuthenticatePath: "/api/internal/mumble/v1/authenticate",
+		ExternalAuthResolvePath:      "/api/internal/mumble/v1/identities/resolve",
+		ExternalAuthTimeout:          1500 * time.Millisecond,
+		ExternalAuthRevalidate:       45 * time.Second,
+		ExternalAuthStaleGrace:       3 * time.Minute,
 	}
 }
 
@@ -201,6 +207,12 @@ func applyFileConfig(cfg *Config, fc *fileConfig) {
 		cfg.AuthMode = strings.ToLower(fc.Auth.Mode)
 	}
 	cfg.ExternalAuthURL = fc.Auth.ExternalURL
+	if fc.Auth.AuthenticatePath != "" {
+		cfg.ExternalAuthAuthenticatePath = fc.Auth.AuthenticatePath
+	}
+	if fc.Auth.ResolvePath != "" {
+		cfg.ExternalAuthResolvePath = fc.Auth.ResolvePath
+	}
 	cfg.ExternalAuthServiceToken = fc.Auth.ServiceToken
 	cfg.ExternalAuthServerInstanceID = fc.Auth.ServerInstanceID
 	if fc.Auth.TimeoutMS > 0 {
@@ -300,6 +312,12 @@ func applyEnv(cfg *Config) {
 	}
 	if v := os.Getenv("MUMBLE_EXTERNAL_AUTH_URL"); v != "" {
 		cfg.ExternalAuthURL = v
+	}
+	if v := os.Getenv("MUMBLE_EXTERNAL_AUTH_AUTHENTICATE_PATH"); v != "" {
+		cfg.ExternalAuthAuthenticatePath = v
+	}
+	if v := os.Getenv("MUMBLE_EXTERNAL_AUTH_RESOLVE_PATH"); v != "" {
+		cfg.ExternalAuthResolvePath = v
 	}
 	if v := os.Getenv("MUMBLE_EXTERNAL_AUTH_SERVICE_TOKEN"); v != "" {
 		cfg.ExternalAuthServiceToken = v

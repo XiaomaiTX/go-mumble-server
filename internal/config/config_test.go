@@ -36,6 +36,12 @@ path = "/var/lib/mumble/db.sqlite"
 
 [logging]
 level = "debug"
+
+[auth]
+mode = "external"
+external_url = "https://identity.example"
+authenticate_path = "/provider/login"
+resolve_path = "/provider/directory"
 `
 	if err := os.WriteFile(path, []byte(toml), 0600); err != nil {
 		t.Fatalf("write config: %v", err)
@@ -58,6 +64,9 @@ level = "debug"
 	}
 	if cfg.LogLevel != "debug" {
 		t.Errorf("LogLevel = %q, want debug", cfg.LogLevel)
+	}
+	if cfg.ExternalAuthAuthenticatePath != "/provider/login" || cfg.ExternalAuthResolvePath != "/provider/directory" {
+		t.Errorf("external paths = %q, %q", cfg.ExternalAuthAuthenticatePath, cfg.ExternalAuthResolvePath)
 	}
 }
 

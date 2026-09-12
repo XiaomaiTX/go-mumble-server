@@ -16,7 +16,7 @@ func TestExternalHTTPAuthorityAuthenticateAndResolve(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
-		case "/internal/mumble/v1/authenticate":
+		case "/custom/authenticate":
 			var request AuthenticateRequest
 			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 				t.Fatal(err)
@@ -25,7 +25,7 @@ func TestExternalHTTPAuthorityAuthenticateAndResolve(t *testing.T) {
 				t.Fatalf("unexpected request: %+v", request)
 			}
 			_, _ = w.Write([]byte(`{"code":200,"data":{"decision":"allow","user_id":173,"name":"Primary Pilot","groups":["authenticated","role:leader"],"identity_version":12,"policy_version":37}}`))
-		case "/internal/mumble/v1/identities/resolve":
+		case "/custom/resolve":
 			_, _ = w.Write([]byte(`{"code":200,"data":{"identities":[{"eligible":true,"user_id":173,"name":"Primary Pilot","groups":["authenticated"],"identity_version":12,"policy_version":37}]}}`))
 		default:
 			http.NotFound(w, r)
@@ -33,7 +33,10 @@ func TestExternalHTTPAuthorityAuthenticateAndResolve(t *testing.T) {
 	}))
 	defer server.Close()
 
-	authority, err := NewExternalHTTPAuthority(ExternalHTTPConfig{BaseURL: server.URL, ServiceToken: "service-secret", Timeout: time.Second})
+	authority, err := NewExternalHTTPAuthority(ExternalHTTPConfig{
+		BaseURL: server.URL, ServiceToken: "service-secret", Timeout: time.Second,
+		AuthenticatePath: "/custom/authenticate", ResolvePath: "/custom/resolve",
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -44,6 +47,18 @@ func TestExternalHTTPAuthorityAuthenticateAndResolve(t *testing.T) {
 	resolved, err := authority.Resolve(context.Background(), ResolveRequest{UserIDs: []uint32{173}})
 	if err != nil || len(resolved) != 1 || !resolved[0].Eligible {
 		t.Fatalf("Resolve = %+v, %v", resolved, err)
+	}
+}
+
+func TestExternalHTTPAuthorityRejectsUnsafeEndpointPaths(t *testing.T) {
+	for _, path := range []string{"https://other.example/authenticate", "//other.example/authenticate", "/authenticate?token=leak"} {
+		_, err := NewExternalHTTPAuthority(ExternalHTTPConfig{
+			BaseURL: "https://identity.example", ServiceToken: "token",
+			AuthenticatePath: path, ResolvePath: "/resolve",
+		})
+		if err == nil {
+			t.Fatalf("unsafe authenticate path %q was accepted", path)
+		}
 	}
 }
 

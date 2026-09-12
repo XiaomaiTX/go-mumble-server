@@ -9,7 +9,9 @@ go-mumble-server 通过通用 External HTTP Identity Provider 决定用户身份
 在启动配置的 `[auth]` 段设置：
 
 - `mode = "external"`：启用外部认证；该模式不会回退 `registered_users`。
-- `external_url`：身份提供者 HTTP 根地址，不包含 `/internal/mumble/v1`。
+- `external_url`：身份提供者的 scheme、host 与可选 base path；具体 endpoint path 单独配置。
+- `authenticate_path`：认证 endpoint 路径，默认 `/api/internal/mumble/v1/authenticate`。
+- `resolve_path`：身份目录 endpoint 路径，默认 `/api/internal/mumble/v1/identities/resolve`。
 - `service_token`：Mumble → 身份提供者服务令牌。
 - `server_instance_id`：当前语音实例的稳定标识。
 - `timeout_ms`：单次外部认证/解析请求的严格超时。
@@ -17,6 +19,8 @@ go-mumble-server 通过通用 External HTTP Identity Provider 决定用户身份
 - `stale_grace_seconds`：提供者暂时不可用时，已在线会话可保留的最长时间；新登录始终 fail closed。
 - `ca_cert`、`client_cert`、`client_key`：私有 CA 与 mTLS 客户端证书，可按部署需要启用。
 - `identity_revalidate_token`：身份提供者 → Mumble 重校验令牌，必须与 `service_token` 不同。
+
+以上两个 endpoint path 也可分别由环境变量 `MUMBLE_EXTERNAL_AUTH_AUTHENTICATE_PATH` 和 `MUMBLE_EXTERNAL_AUTH_RESOLVE_PATH` 覆盖。路径必须以单个 `/` 开头，不能填写完整 URL，也不能包含 query 或 fragment，防止服务令牌被发送到非预期目标。
 
 接入方的双向令牌、Mumble 管理地址和回调超时均由接入方安全配置，不写入本服务配置仓库。
 
@@ -32,9 +36,9 @@ go-mumble-server 通过通用 External HTTP Identity Provider 决定用户身份
 
 ## HTTP 契约与兼容策略
 
-认证请求为 `POST /internal/mumble/v1/authenticate`，包含 `server_instance_id`、`username`、`password` 以及可选的 `certificate_hash`、`remote_ip`。响应的 `decision` 只能是 `allow` 或 `deny`：`allow` 必须携带非零 `user_id`、`name` 和可选 `groups`、`identity_version`、`policy_version`；密码错误、账户禁用等属于 `deny`，网络错误、超时、5xx 与无效 JSON 都属于 provider error。
+认证请求发送到 `authenticate_path`，包含 `server_instance_id`、`username`、`password` 以及可选的 `certificate_hash`、`remote_ip`。响应的 `decision` 只能是 `allow` 或 `deny`：`allow` 必须携带非零 `user_id`、`name` 和可选 `groups`、`identity_version`、`policy_version`；密码错误、账户禁用等属于 `deny`，网络错误、超时、5xx 与无效 JSON 都属于 provider error。
 
-目录解析请求为 `POST /internal/mumble/v1/identities/resolve`，可同时携带 `user_ids` 和 `names`，响应 `identities`，因此 `QueryUsers` 以稳定 ID↔名称工作且不依赖在线 session。当前实现一次请求支持多个 ID，供周期性重验批量使用。
+目录解析请求发送到 `resolve_path`，可同时携带 `user_ids` 和 `names`，响应 `identities`，因此 `QueryUsers` 以稳定 ID↔名称工作且不依赖在线 session。当前实现一次请求支持多个 ID，供周期性重验批量使用。
 
 外部模式下，Mumble 原生 `UserList` 的 rename/unregister 不会写回身份提供者；该类 mutation 保持 unsupported/read-only。外部平台管理员角色与 Mumble protocol `SuperUser` 是独立概念，外部响应不能使用 ID 0 或 `SuperUser` 名称取得该特权。
 

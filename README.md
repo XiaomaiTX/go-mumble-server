@@ -143,10 +143,7 @@ services:
       - "64730:64730/tcp"
     environment:
       MUMBLE_DATABASE_PATH: /data/mumble-server.sqlite
-      MUMBLE_AUTH_MODE: ${MUMBLE_AUTH_MODE:-local}
-      MUMBLE_EXTERNAL_AUTH_URL: ${MUMBLE_EXTERNAL_AUTH_URL:-}
       MUMBLE_EXTERNAL_AUTH_SERVICE_TOKEN: ${MUMBLE_EXTERNAL_AUTH_SERVICE_TOKEN:-}
-      MUMBLE_EXTERNAL_AUTH_SERVER_INSTANCE_ID: ${MUMBLE_EXTERNAL_AUTH_SERVER_INSTANCE_ID:-voice-server-01}
       MUMBLE_IDENTITY_REVALIDATE_TOKEN: ${MUMBLE_IDENTITY_REVALIDATE_TOKEN:-}
     volumes:
       - mumble-data:/data
@@ -166,8 +163,8 @@ volumes:
 
 Notes:
 
-- 外部身份部署可先执行 `cp .env.example .env`，再填写实际 URL 和两个不同方向的服务令牌；`.env` 已被 Git 忽略。
-- SQLite 数据位于 `mumble-data` 命名卷；TOML 在每次启动时读取。外部身份令牌应通过宿主机环境、`.env`（不要提交）或容器平台 Secret 注入，修改身份配置后需要重启容器。
+- 外部身份部署可先执行 `cp .env.example .env`，再填写两个不同方向的服务令牌；`.env` 已被 Git 忽略。
+- SQLite 数据位于 `mumble-data` 命名卷；TOML 在每次启动时读取。认证模式、URL、实例 ID、超时和证书路径统一写入 TOML，两个身份令牌通过宿主机环境、`.env`（不要提交）或容器平台 Secret 注入。修改身份配置后需要重启容器。
 - The image starts as root, fixes `/data` ownership, then drops privileges to the built-in `mumble` user (UID/GID 999). Bind-mounted data directories work out of the box regardless of the host directory's owner.
 - On images built before this behavior existed (≤ commit `f5e651f`), fix a bind-mounted data directory manually:
   `mkdir -p mumble-data && sudo chown 999:999 mumble-data` — or switch to a named volume.
@@ -238,7 +235,7 @@ See [docs/technical-overview.md](docs/technical-overview.md) for the full config
 
 `[auth].mode` 默认为 `local`，保持本地 registered user、密码和证书登录兼容。设为 `external` 后，协议层只通过 External HTTP Identity Provider 完成认证和稳定 ID↔名称查询；provider 的 `deny` 会拒绝登录，超时、5xx 或无效响应同样 fail closed，绝不会回退到本地账户。
 
-提供者的 authenticate 与 resolve 接口分别为 `POST /internal/mumble/v1/authenticate` 和 `POST /internal/mumble/v1/identities/resolve`。认证响应必须给出非零 stable user ID、canonical name 和可选的权威运行时组。客户端 access token 与权威组分别保存，权威组不持久化到 SQLite；在线会话会按 `revalidate_interval_seconds` 重验，并受 `stale_grace_seconds` 约束。详见[外部身份提供者接入文档](docs/fuxi-seat-external-identity.md)。
+提供者的认证与目录 endpoint 分别由 `authenticate_path` 和 `resolve_path` 配置，默认采用 `/api/internal/mumble/v1/...`，可适配其它 HTTP 身份系统而无需修改核心代码。认证响应必须给出非零 stable user ID、canonical name 和可选的权威运行时组。客户端 access token 与权威组分别保存，权威组不持久化到 SQLite；在线会话会按 `revalidate_interval_seconds` 重验，并受 `stale_grace_seconds` 约束。详见[外部身份提供者接入文档](docs/fuxi-seat-external-identity.md)。
 
 ## Web Management UI
 
