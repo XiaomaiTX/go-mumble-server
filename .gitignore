@@ -29,6 +29,9 @@ cmd/go-mumble-server/frontend-dist/
 *.db
 
 # Keys and secrets
+.env
+.env.*
+!.env.example
 *.pem
 *.key
 *.crt

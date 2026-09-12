@@ -1,14 +1,29 @@
 services:
   go-mumble-server:
     build: .
+    command: ["-config", "/config/mumble-server.toml"]
     ports:
       - "64738:64738/tcp"
       - "64738:64738/udp"
       - "64730:64730/tcp"
     environment:
+      # SQLite 保存运行时配置、频道、ACL 和注册用户。
       MUMBLE_DATABASE_PATH: /data/mumble-server.sqlite
+
+      # 身份配置每次启动时读取，不会写入 SQLite。
+      # 非敏感项可以直接修改挂载的 TOML；敏感项建议从宿主机环境或 .env 注入。
+      MUMBLE_AUTH_MODE: ${MUMBLE_AUTH_MODE:-local}
+      MUMBLE_EXTERNAL_AUTH_URL: ${MUMBLE_EXTERNAL_AUTH_URL:-}
+      MUMBLE_EXTERNAL_AUTH_SERVICE_TOKEN: ${MUMBLE_EXTERNAL_AUTH_SERVICE_TOKEN:-}
+      MUMBLE_EXTERNAL_AUTH_SERVER_INSTANCE_ID: ${MUMBLE_EXTERNAL_AUTH_SERVER_INSTANCE_ID:-voice-server-01}
+      MUMBLE_IDENTITY_REVALIDATE_TOKEN: ${MUMBLE_IDENTITY_REVALIDATE_TOKEN:-}
     volumes:
+      # 命名卷持久化 SQLite 数据；删除或重建容器不会丢失。
       - mumble-data:/data
+      # TOML 是每次启动都会读取的 bootstrap 配置，并非只使用一次的种子文件。
+      - ./configs/mumble-server.toml:/config/mumble-server.toml:ro
+      # 使用私有 CA 或 mTLS 时取消注释，并在 TOML 中填写 /certs 下的路径。
+      # - ./certs:/certs:ro
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:64730/health"]

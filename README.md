@@ -136,14 +136,22 @@ Build the image and run it with Docker Compose:
 services:
   go-mumble-server:
     image: go-mumble-server:latest   # build with: docker build -t go-mumble-server:latest .
+    command: ["-config", "/config/mumble-server.toml"]
     ports:
       - "64738:64738/tcp"
       - "64738:64738/udp"
       - "64730:64730/tcp"
     environment:
       MUMBLE_DATABASE_PATH: /data/mumble-server.sqlite
+      MUMBLE_AUTH_MODE: ${MUMBLE_AUTH_MODE:-local}
+      MUMBLE_EXTERNAL_AUTH_URL: ${MUMBLE_EXTERNAL_AUTH_URL:-}
+      MUMBLE_EXTERNAL_AUTH_SERVICE_TOKEN: ${MUMBLE_EXTERNAL_AUTH_SERVICE_TOKEN:-}
+      MUMBLE_EXTERNAL_AUTH_SERVER_INSTANCE_ID: ${MUMBLE_EXTERNAL_AUTH_SERVER_INSTANCE_ID:-voice-server-01}
+      MUMBLE_IDENTITY_REVALIDATE_TOKEN: ${MUMBLE_IDENTITY_REVALIDATE_TOKEN:-}
     volumes:
-      - ./mumble-data:/data          # bind mount, or use a named volume instead
+      - mumble-data:/data
+      - ./configs/mumble-server.toml:/config/mumble-server.toml:ro
+      # - ./certs:/certs:ro          # 私有 CA 或 mTLS 证书目录
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:64730/health"]
@@ -151,10 +159,15 @@ services:
       timeout: 5s
       retries: 3
       start_period: 5s
+
+volumes:
+  mumble-data:
 ```
 
 Notes:
 
+- 外部身份部署可先执行 `cp .env.example .env`，再填写实际 URL 和两个不同方向的服务令牌；`.env` 已被 Git 忽略。
+- SQLite 数据位于 `mumble-data` 命名卷；TOML 在每次启动时读取。外部身份令牌应通过宿主机环境、`.env`（不要提交）或容器平台 Secret 注入，修改身份配置后需要重启容器。
 - The image starts as root, fixes `/data` ownership, then drops privileges to the built-in `mumble` user (UID/GID 999). Bind-mounted data directories work out of the box regardless of the host directory's owner.
 - On images built before this behavior existed (≤ commit `f5e651f`), fix a bind-mounted data directory manually:
   `mkdir -p mumble-data && sudo chown 999:999 mumble-data` — or switch to a named volume.
