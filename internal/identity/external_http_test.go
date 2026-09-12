@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -85,4 +86,19 @@ func TestExternalHTTPAuthorityRejectsReservedIdentityAndTimesOut(t *testing.T) {
 			t.Fatal("timeout must fail closed")
 		}
 	})
+}
+
+func TestExternalHTTPAuthorityPreservesSafeProviderErrorMessage(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"code":400,"msg":"server_instance_id is required"}`))
+	}))
+	defer server.Close()
+	authority, err := NewExternalHTTPAuthority(ExternalHTTPConfig{BaseURL: server.URL, ServiceToken: "token", Timeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = authority.Authenticate(context.Background(), AuthenticateRequest{})
+	if err == nil || !strings.Contains(err.Error(), "server_instance_id is required") {
+		t.Fatalf("error = %v, want provider message", err)
+	}
 }

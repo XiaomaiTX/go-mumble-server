@@ -212,13 +212,21 @@ func (a *ExternalHTTPAuthority) post(ctx context.Context, path string, input, ou
 	}
 	var envelope struct {
 		Code int             `json:"code"`
+		Msg  string          `json:"msg"`
 		Data json.RawMessage `json:"data"`
 	}
 	if err := json.NewDecoder(limited).Decode(&envelope); err != nil {
 		return fmt.Errorf("%w: decode response", ErrAuthorityUnavailable)
 	}
 	if envelope.Code != 0 && envelope.Code != 200 {
-		return fmt.Errorf("%w: authority code %d", ErrAuthorityUnavailable, envelope.Code)
+		message := strings.TrimSpace(strings.ReplaceAll(strings.ReplaceAll(envelope.Msg, "\r", " "), "\n", " "))
+		if len(message) > 256 {
+			message = message[:256]
+		}
+		if message == "" {
+			return fmt.Errorf("%w: authority code %d", ErrAuthorityUnavailable, envelope.Code)
+		}
+		return fmt.Errorf("%w: authority code %d: %s", ErrAuthorityUnavailable, envelope.Code, message)
 	}
 	if err := json.Unmarshal(envelope.Data, output); err != nil {
 		return fmt.Errorf("%w: decode response data", ErrAuthorityUnavailable)
