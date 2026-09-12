@@ -117,7 +117,7 @@ func (a *ExternalHTTPAuthority) Authenticate(ctx context.Context, req Authentica
 		PolicyVersion   uint64   `json:"policy_version"`
 	}
 	if err := a.post(ctx, a.authenticatePath, req, &response); err != nil {
-		return AuthenticateResult{}, err
+		return AuthenticateResult{}, fmt.Errorf("authenticate endpoint %s: %w", a.authenticatePath, err)
 	}
 	if strings.EqualFold(response.Decision, string(DecisionDeny)) {
 		return AuthenticateResult{Decision: DecisionDeny}, nil
@@ -144,7 +144,7 @@ func (a *ExternalHTTPAuthority) Resolve(ctx context.Context, req ResolveRequest)
 		} `json:"identities"`
 	}
 	if err := a.post(ctx, a.resolvePath, req, &response); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("resolve endpoint %s: %w", a.resolvePath, err)
 	}
 	identities := make([]Identity, 0, len(response.Identities))
 	for _, item := range response.Identities {

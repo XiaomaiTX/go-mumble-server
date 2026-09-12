@@ -898,13 +898,27 @@ func (s *Server) handleAuthenticate(msgType protocol.MessageType, payload []byte
 			remoteIP = addr.String()
 		}
 	}
-	authResult, err := s.authority.Authenticate(context.Background(), identity.AuthenticateRequest{
+	authRequest := identity.AuthenticateRequest{
 		ServerInstanceID: s.cfg.ExternalAuthServerInstanceID,
 		Username:         authMsg.Username, Password: authMsg.Password,
 		CertificateHash: certHash, RemoteIP: remoteIP,
-	})
+	}
+	// Password-based external identity providers cannot authenticate a request
+	// that omits the password. Use Murmur's standard rejection type so clients
+	// that support interactive password entry can retry with a password; this is
+	// a client-input condition, not a provider outage.
+	if s.authority.External() && authRequest.Password == "" {
+		return s.sendReject(c, messages.RejectWrongServerPW, "Password required")
+	}
+	authResult, err := s.authority.Authenticate(context.Background(), authRequest)
 	if err != nil {
-		slog.Warn("identity authentication failed closed", "err", err)
+		// Keep diagnostics useful without logging passwords or certificate values.
+		slog.Warn("identity authentication failed closed", "err", err,
+			"identity_username", authRequest.Username,
+			"identity_password_present", authRequest.Password != "",
+			"identity_server_instance_id", authRequest.ServerInstanceID,
+			"identity_certificate_present", authRequest.CertificateHash != "",
+			"identity_remote_ip", authRequest.RemoteIP)
 		return s.sendReject(c, messages.RejectAuthenticatorFail, "Identity service unavailable")
 	}
 	if authResult.Decision != identity.DecisionAllow {
