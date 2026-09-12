@@ -1030,7 +1030,14 @@ func sanitizedClientTokens(tokens []string) []string {
 }
 
 func (s *Server) sendReject(c *connection.Conn, typ messages.RejectType, reason string) error {
-	return c.WriteMessage(protocol.MessageReject, &messages.Reject{Type: typ, Reason: reason})
+	err := c.WriteMessage(protocol.MessageReject, &messages.Reject{Type: typ, Reason: reason})
+	// Murmur disconnects immediately after sending Reject (murmur/Messages.cpp:
+	// sendMessage(reject) then disconnectSocket()). Official clients raise the
+	// password retry prompt from the disconnect event, keyed on the reject type,
+	// so a rejected connection must not linger or the prompt fires at a random
+	// later moment (ping watchdog, manual disconnect, next reconnect).
+	go c.CloseAfterFlush()
+	return err
 }
 
 func cryptoModeString(mode crypto.Mode) string {
