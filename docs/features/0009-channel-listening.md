@@ -37,6 +37,16 @@ targets (with the same group restriction as occupants).
 | Login sync carries every user's listening list; volumes are owner-only | `broadcastListenerVolumeAdjustments = false` default | `sendSync` attaches `ChannelsFor` to every roster snapshot and `ListeningVolumes` to the syncing user's own only |
 | Volume adjustment for a channel not being listened to is warned and ignored | `setChannelListenerVolume` | `SetVolume` no-ops without a listening relationship |
 
+## Client-side version gate
+
+The Mumble client only shows the channel context-menu "Listen" entry when the
+server reports version >= 1.4.0 (`MainWindow.cpp qmChannel_aboutToShow` checks
+`Global::get().sh->m_version`). That is why the control-channel `Version`
+message carries `VersionV1` = 1.4.0 (`mumble.ServerVersionV1`), and why the
+advertisement must stay below 1.5.0 until protobuf UDP voice (issue #22) is
+implemented — a 1.5.x handshake would switch 1.5 clients to the new UDP voice
+format this server cannot parse. `version_test.go` guards this window.
+
 ## Known deviations
 
 1. **Truthful deltas instead of echo.** Murmur broadcasts the *original*

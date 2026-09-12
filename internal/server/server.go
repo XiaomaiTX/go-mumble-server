@@ -231,6 +231,7 @@ func (s *Server) acceptLoop(ctx context.Context, ln net.Listener, ms *mumble.Ser
 		})
 		go func() {
 			_ = conn.WriteMessage(protocol.MessageVersion, &messages.Version{
+				VersionV1:   mumble.ServerVersionV1,
 				Release:     "go-mumble-server",
 				OS:          "Go",
 				OSVersion:   "1.0",

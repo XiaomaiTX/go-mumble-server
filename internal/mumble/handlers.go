@@ -243,9 +243,19 @@ func (s *Server) HandleUDP(addr net.Addr, data []byte) {
 	_ = s.router.Route(senderSession, target, outgoing)
 }
 
-// Version reported in server-list ping replies. The legacy format cannot express
-// v2 versions, so both fields carry the same 1.5.0 value in their respective
-// encodings (see Murmur's Version::toLegacyVersion and version_v2 packing).
+// ServerVersionV1 is the version advertised in the control-channel Version
+// message. Clients gate features on it: >=1.4.0 shows the channel-listening UI
+// (issue #19), but >=1.5.0 makes 1.5 clients negotiate the protobuf UDP voice
+// protocol, which this server cannot parse yet (issue #22) — it speaks legacy
+// varint voice only. Keep the advertisement in the 1.4.x range until #22 lands.
+const ServerVersionV1 = uint32(1<<16 | 4<<8) // 1.4.0 as (major<<16)|(minor<<8)|patch
+
+// Version reported in server-list ping replies. This is a display field for
+// public-server listings, not a protocol negotiation: unlike
+// ServerVersionV1 above it does not gate client behavior, so it can advertise
+// 1.5.0 regardless of #22. The legacy format cannot express v2 versions, so
+// both fields carry the same 1.5.0 value in their respective encodings (see
+// Murmur's Version::toLegacyVersion and version_v2 packing).
 const (
 	pingLegacyVersion  = uint32(1<<16 | 5<<8)  // 1.5.0 as (major<<16)|(minor<<8)|patch
 	pingVersionV2      = uint64(1<<48 | 5<<32) // 1.5.0 as major<<48|minor<<32|patch<<16
