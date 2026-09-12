@@ -5,6 +5,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/BurntSushi/toml"
 )
@@ -39,8 +40,19 @@ type Config struct {
 	// MaxTextMessageLength and MaxImageMessageLength bound user-supplied text and
 	// image payloads (chat messages, user comments, avatar textures), matching
 	// murmur's iMaxTextMessageLength / iMaxImageMessageLength. 0 means unlimited.
-	MaxTextMessageLength  int
-	MaxImageMessageLength int
+	MaxTextMessageLength         int
+	MaxImageMessageLength        int
+	AuthMode                     string
+	ExternalAuthURL              string
+	ExternalAuthServiceToken     string
+	ExternalAuthServerInstanceID string
+	ExternalAuthTimeout          time.Duration
+	ExternalAuthRevalidate       time.Duration
+	ExternalAuthStaleGrace       time.Duration
+	ExternalAuthCACertPath       string
+	ExternalAuthClientCertPath   string
+	ExternalAuthClientKeyPath    string
+	IdentityRevalidateToken      string
 }
 
 // fileConfig mirrors the TOML structure for parsing.
@@ -78,6 +90,19 @@ type fileConfig struct {
 		Enabled bool   `toml:"enabled"`
 		Name    string `toml:"register_name"`
 	} `toml:"bonjour"`
+	Auth struct {
+		Mode                      string `toml:"mode"`
+		ExternalURL               string `toml:"external_url"`
+		ServiceToken              string `toml:"service_token"`
+		ServerInstanceID          string `toml:"server_instance_id"`
+		TimeoutMS                 int    `toml:"timeout_ms"`
+		RevalidateIntervalSeconds int    `toml:"revalidate_interval_seconds"`
+		StaleGraceSeconds         int    `toml:"stale_grace_seconds"`
+		CACert                    string `toml:"ca_cert"`
+		ClientCert                string `toml:"client_cert"`
+		ClientKey                 string `toml:"client_key"`
+		IdentityRevalidateToken   string `toml:"identity_revalidate_token"`
+	} `toml:"auth"`
 }
 
 // defaults returns the default configuration.
@@ -97,9 +122,13 @@ func defaults() *Config {
 		ChannelDepth:  10,
 		ChannelCount:  1000,
 		// Murmur's defaults for the same settings.
-		AllowRecording:        true,
-		MaxTextMessageLength:  5000,
-		MaxImageMessageLength: 131072,
+		AllowRecording:         true,
+		MaxTextMessageLength:   5000,
+		MaxImageMessageLength:  131072,
+		AuthMode:               "local",
+		ExternalAuthTimeout:    1500 * time.Millisecond,
+		ExternalAuthRevalidate: 45 * time.Second,
+		ExternalAuthStaleGrace: 3 * time.Minute,
 	}
 }
 
@@ -168,6 +197,25 @@ func applyFileConfig(cfg *Config, fc *fileConfig) {
 	if fc.Bonjour.Name != "" {
 		cfg.RegisterName = fc.Bonjour.Name
 	}
+	if fc.Auth.Mode != "" {
+		cfg.AuthMode = strings.ToLower(fc.Auth.Mode)
+	}
+	cfg.ExternalAuthURL = fc.Auth.ExternalURL
+	cfg.ExternalAuthServiceToken = fc.Auth.ServiceToken
+	cfg.ExternalAuthServerInstanceID = fc.Auth.ServerInstanceID
+	if fc.Auth.TimeoutMS > 0 {
+		cfg.ExternalAuthTimeout = time.Duration(fc.Auth.TimeoutMS) * time.Millisecond
+	}
+	if fc.Auth.RevalidateIntervalSeconds > 0 {
+		cfg.ExternalAuthRevalidate = time.Duration(fc.Auth.RevalidateIntervalSeconds) * time.Second
+	}
+	if fc.Auth.StaleGraceSeconds > 0 {
+		cfg.ExternalAuthStaleGrace = time.Duration(fc.Auth.StaleGraceSeconds) * time.Second
+	}
+	cfg.ExternalAuthCACertPath = fc.Auth.CACert
+	cfg.ExternalAuthClientCertPath = fc.Auth.ClientCert
+	cfg.ExternalAuthClientKeyPath = fc.Auth.ClientKey
+	cfg.IdentityRevalidateToken = fc.Auth.IdentityRevalidateToken
 }
 
 func applyEnv(cfg *Config) {
@@ -246,5 +294,44 @@ func applyEnv(cfg *Config) {
 	}
 	if v := os.Getenv("MUMBLE_CERT_REQUIRED"); v != "" {
 		cfg.CertRequired = strings.ToLower(v) == "true" || v == "1"
+	}
+	if v := os.Getenv("MUMBLE_AUTH_MODE"); v != "" {
+		cfg.AuthMode = strings.ToLower(v)
+	}
+	if v := os.Getenv("MUMBLE_EXTERNAL_AUTH_URL"); v != "" {
+		cfg.ExternalAuthURL = v
+	}
+	if v := os.Getenv("MUMBLE_EXTERNAL_AUTH_SERVICE_TOKEN"); v != "" {
+		cfg.ExternalAuthServiceToken = v
+	}
+	if v := os.Getenv("MUMBLE_EXTERNAL_AUTH_SERVER_INSTANCE_ID"); v != "" {
+		cfg.ExternalAuthServerInstanceID = v
+	}
+	if v := os.Getenv("MUMBLE_EXTERNAL_AUTH_TIMEOUT_MS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.ExternalAuthTimeout = time.Duration(n) * time.Millisecond
+		}
+	}
+	if v := os.Getenv("MUMBLE_EXTERNAL_AUTH_REVALIDATE_SECONDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.ExternalAuthRevalidate = time.Duration(n) * time.Second
+		}
+	}
+	if v := os.Getenv("MUMBLE_EXTERNAL_AUTH_STALE_GRACE_SECONDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.ExternalAuthStaleGrace = time.Duration(n) * time.Second
+		}
+	}
+	if v := os.Getenv("MUMBLE_EXTERNAL_AUTH_CA_CERT"); v != "" {
+		cfg.ExternalAuthCACertPath = v
+	}
+	if v := os.Getenv("MUMBLE_EXTERNAL_AUTH_CLIENT_CERT"); v != "" {
+		cfg.ExternalAuthClientCertPath = v
+	}
+	if v := os.Getenv("MUMBLE_EXTERNAL_AUTH_CLIENT_KEY"); v != "" {
+		cfg.ExternalAuthClientKeyPath = v
+	}
+	if v := os.Getenv("MUMBLE_IDENTITY_REVALIDATE_TOKEN"); v != "" {
+		cfg.IdentityRevalidateToken = v
 	}
 }

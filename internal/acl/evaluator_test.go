@@ -20,6 +20,11 @@ func newTestEvaluator(t *testing.T) (*Evaluator, *channel.Manager, *gorm.DB, *us
 	if err != nil {
 		t.Fatalf("open db: %v", err)
 	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatalf("get sql db: %v", err)
+	}
+	t.Cleanup(func() { _ = sqlDB.Close() })
 	chans := channel.NewManager(db, testServerID)
 	users := user.NewManager(db, 10)
 	return NewEvaluator(db, chans, users), chans, db, users
@@ -177,5 +182,26 @@ func TestEvaluator_UnknownChannelFallsBackToBaseline(t *testing.T) {
 	}
 	if e.Check(Subject{}, 4242, mumble.PermissionMuteDeafen) {
 		t.Error("unknown channel handed out an administrative permission")
+	}
+}
+
+func TestEvaluatorExternalGroupsAreRuntimeOnly(t *testing.T) {
+	e, chans, db, users := newTestEvaluator(t)
+	root := chans.RootID()
+	if err := CreateACL(db, &models.ChannelACL{ServerID: testServerID, ChannelID: uint(root), Priority: 10, ApplyHere: true, ApplySubs: true, GroupName: "role:leader", Grant: uint32(mumble.PermissionKick)}); err != nil {
+		t.Fatal(err)
+	}
+	external, _ := users.Add(mumble.User{Name: "external", UserID: 173, ChannelID: root, ExternalIdentity: true, ExternalGroups: []string{"role:leader"}})
+	forged, _ := users.Add(mumble.User{Name: "forged", UserID: 174, ChannelID: root, AccessTokens: []string{"role:leader"}})
+	storedOnly, _ := users.Add(mumble.User{Name: "stored", UserID: 175, ChannelID: root})
+	e.InvalidateCache()
+	if !e.Check(SubjectOf(external), root, mumble.PermissionKick) {
+		t.Fatal("external runtime group should match ACL")
+	}
+	if e.Check(SubjectOf(forged), root, mumble.PermissionKick) {
+		t.Fatal("client token must not forge an authority-issued runtime group")
+	}
+	if e.Check(SubjectOf(storedOnly), root, mumble.PermissionKick) {
+		t.Fatal("stored membership must not claim an authority-issued runtime group")
 	}
 }

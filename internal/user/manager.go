@@ -238,6 +238,29 @@ func (m *Manager) UpdateUser(sessionID uint32, fn func(*mumble.User)) (mumble.Us
 	return cloneUser(u), true
 }
 
+// UpdateIdentity atomically updates identity fields and keeps the name index in
+// sync. It rejects a canonical rename that collides with another live session.
+func (m *Manager) UpdateIdentity(sessionID uint32, fn func(*mumble.User)) (mumble.User, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	u := m.bySession[sessionID]
+	if u == nil {
+		return mumble.User{}, false
+	}
+	oldName := u.Name
+	candidate := cloneUser(u)
+	fn(&candidate)
+	if other := m.byName[candidate.Name]; other != nil && other.SessionID != sessionID {
+		return mumble.User{}, false
+	}
+	*u = cloneUser(&candidate)
+	if oldName != u.Name {
+		delete(m.byName, oldName)
+		m.byName[u.Name] = u
+	}
+	return cloneUser(u), true
+}
+
 func cloneUser(u *mumble.User) mumble.User {
 	out := *u
 	if u.Texture != nil {
@@ -248,6 +271,9 @@ func cloneUser(u *mumble.User) mumble.User {
 	}
 	if u.AccessTokens != nil {
 		out.AccessTokens = append([]string(nil), u.AccessTokens...)
+	}
+	if u.ExternalGroups != nil {
+		out.ExternalGroups = append([]string(nil), u.ExternalGroups...)
 	}
 	return out
 }

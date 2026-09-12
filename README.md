@@ -221,6 +221,12 @@ Managed via REST API (`/api/v1/meta/config`, `/api/v1/servers/:id/config`) and t
 
 See [docs/technical-overview.md](docs/technical-overview.md) for the full configuration reference.
 
+### 外部身份提供者
+
+`[auth].mode` 默认为 `local`，保持本地 registered user、密码和证书登录兼容。设为 `external` 后，协议层只通过 External HTTP Identity Provider 完成认证和稳定 ID↔名称查询；provider 的 `deny` 会拒绝登录，超时、5xx 或无效响应同样 fail closed，绝不会回退到本地账户。
+
+提供者的 authenticate 与 resolve 接口分别为 `POST /internal/mumble/v1/authenticate` 和 `POST /internal/mumble/v1/identities/resolve`。认证响应必须给出非零 stable user ID、canonical name 和可选的权威运行时组。客户端 access token 与权威组分别保存，权威组不持久化到 SQLite；在线会话会按 `revalidate_interval_seconds` 重验，并受 `stale_grace_seconds` 约束。详见[外部身份提供者接入文档](docs/fuxi-seat-external-identity.md)。
+
 ## Web Management UI
 
 The server includes a Vue 3 + Vuetify management frontend that is embedded into the Go binary and served on the REST API port (default `:64730`). Open `http://localhost:64730` in a browser to access the management interface.

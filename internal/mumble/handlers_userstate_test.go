@@ -46,6 +46,12 @@ func newUserStateTestServer(t *testing.T, u *mumble.User) (*Server, *connection.
 
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() { _ = c.Run(ctx, protocol.HandlerTable{}) }()
+	if err := c.WriteMessage(protocol.MessagePing, &messages.Ping{}); err != nil {
+		t.Fatalf("queue writer readiness probe: %v", err)
+	}
+	if _, _, err := protocol.ReadPacket(clientSide); err != nil {
+		t.Fatalf("read writer readiness probe: %v", err)
+	}
 	t.Cleanup(func() {
 		cancel()
 		_ = clientSide.Close()
@@ -64,6 +70,11 @@ func newACLTestServer(t *testing.T) *Server {
 	if err != nil {
 		t.Fatalf("open db: %v", err)
 	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatalf("get sql db: %v", err)
+	}
+	t.Cleanup(func() { _ = sqlDB.Close() })
 	return NewServer(&config.Config{
 		MaxUsers:              100,
 		AllowRecording:        true,

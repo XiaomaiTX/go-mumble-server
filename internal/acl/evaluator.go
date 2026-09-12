@@ -246,6 +246,16 @@ func (e *Evaluator) userHasToken(u *mumble.User, token string) bool {
 }
 
 func (e *Evaluator) userInGroup(userID uint32, groupName string, resolveChannelID uint32, userChannelID uint32, u *mumble.User) bool {
+	// Authority-issued groups are independent from client access tokens and
+	// persisted memberships. They are current-session claims and are never
+	// written to SQLite. Built-in selectors below retain their protocol meaning.
+	if u != nil && u.ExternalIdentity {
+		for _, claim := range u.ExternalGroups {
+			if claim == groupName {
+				return true
+			}
+		}
+	}
 	switch groupName {
 	case "all":
 		return true

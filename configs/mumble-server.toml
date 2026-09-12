@@ -3,8 +3,9 @@
 # This file is used for initial seeding only. On first run, values from this file
 # are written to the SQLite database. After that, runtime settings are managed via
 # the REST API (GET/PATCH /api/v1/meta/config, /api/v1/servers/:id/config) or the
-# web management UI. Only database.path, tls.cert, tls.key, logging.level, and
-# frontend-embed (flag) remain in this file permanently.
+# web management UI. Bootstrap/runtime infrastructure fields such as database,
+# TLS, logging, frontend-embed, and external identity authority settings remain
+# process-level configuration in this file.
 
 [network]
 # Mumble protocol port (TCP + UDP)
@@ -55,3 +56,19 @@ cert_required = false
 enabled = false
 # Display name for LAN discovery
 register_name = "go-mumble-server"
+
+[auth]
+# local 用于独立部署；external 用于外部身份提供者，且不会回退本地认证。
+mode = "local"
+external_url = ""
+service_token = ""
+server_instance_id = "voice-server-01"
+timeout_ms = 1500
+revalidate_interval_seconds = 45
+stale_grace_seconds = 180
+# 生产环境推荐配置私有 CA 和 mTLS 客户端证书。
+ca_cert = ""
+client_cert = ""
+client_key = ""
+# 外部身份服务调用在线重验入口时使用，必须与 service_token 不同。
+identity_revalidate_token = ""

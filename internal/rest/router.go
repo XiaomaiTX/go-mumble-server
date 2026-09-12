@@ -2,6 +2,9 @@ package rest
 
 import (
 	"bytes"
+	"context"
+	"crypto/subtle"
+	"encoding/json"
 	"io"
 	"io/fs"
 	"mime"
@@ -48,8 +51,15 @@ type OnACLChange func(serverID uint)
 // OnBanChange is called when bans are created or deleted via REST (for Mumble cache invalidation).
 type OnBanChange func(serverID uint)
 
+type RevalidateIdentity func(context.Context, uint32) error
+
 // RouterWithMumble sets up the REST API with optional Mumble connected-user listing.
 func RouterWithMumble(db *gorm.DB, cfg *config.Config, feFS fs.FS, userLister handler.ConnectedUserLister, userActioner handler.ConnectedUserActioner, channelCrypto handler.ChannelCryptoLister, getChanMgr GetChannelManager, onACLChange OnACLChange, onBanChange OnBanChange, onChannelMutated handler.OnChannelMutated, onConfigChange handler.OnConfigChange) http.Handler {
+	return RouterWithMumbleAndIdentity(db, cfg, feFS, userLister, userActioner, channelCrypto, getChanMgr, onACLChange, onBanChange, onChannelMutated, onConfigChange, nil)
+}
+
+// RouterWithMumbleAndIdentity adds the provider-neutral callback endpoint.
+func RouterWithMumbleAndIdentity(db *gorm.DB, cfg *config.Config, feFS fs.FS, userLister handler.ConnectedUserLister, userActioner handler.ConnectedUserActioner, channelCrypto handler.ChannelCryptoLister, getChanMgr GetChannelManager, onACLChange OnACLChange, onBanChange OnBanChange, onChannelMutated handler.OnChannelMutated, onConfigChange handler.OnConfigChange, revalidate RevalidateIdentity) http.Handler {
 	userSvc := service.NewUserService(db, cfg)
 	authHandler := handler.NewAuthHandler(userSvc, db, cfg)
 	userHandler := handler.NewUserHandler(userSvc)
@@ -64,6 +74,35 @@ func RouterWithMumble(db *gorm.DB, cfg *config.Config, feFS fs.FS, userLister ha
 	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Write([]byte(`{"status":"ok"}`))
+	})
+
+	r.Post("/internal/identity/v1/revalidate", func(w http.ResponseWriter, r *http.Request) {
+		expected := strings.TrimSpace(cfg.IdentityRevalidateToken)
+		provided := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+		if expected == "" || provided == "" || subtle.ConstantTimeCompare([]byte(expected), []byte(provided)) != 1 {
+			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+			return
+		}
+		if revalidate == nil {
+			http.Error(w, `{"error":"external identity mode unavailable"}`, http.StatusServiceUnavailable)
+			return
+		}
+		var body struct {
+			UserID uint32 `json:"user_id"`
+		}
+		decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&body); err != nil || body.UserID == 0 {
+			http.Error(w, `{"error":"invalid request"}`, http.StatusBadRequest)
+			return
+		}
+		if err := revalidate(r.Context(), body.UserID); err != nil {
+			http.Error(w, `{"error":"revalidation failed"}`, http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"status":"accepted"}`))
 	})
 
 	r.Get("/api/v1/openapi.yaml", func(w http.ResponseWriter, r *http.Request) {

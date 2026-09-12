@@ -155,6 +155,17 @@ func ConfigForServer(meta *MetaConfig, server *ServerConfigData, bootstrap *Conf
 		cfg.SSLKeyPath = bootstrap.SSLKeyPath
 		cfg.LogLevel = bootstrap.LogLevel
 		cfg.FrontendEmbed = bootstrap.FrontendEmbed
+		cfg.AuthMode = bootstrap.AuthMode
+		cfg.ExternalAuthURL = bootstrap.ExternalAuthURL
+		cfg.ExternalAuthServiceToken = bootstrap.ExternalAuthServiceToken
+		cfg.ExternalAuthServerInstanceID = bootstrap.ExternalAuthServerInstanceID
+		cfg.ExternalAuthTimeout = bootstrap.ExternalAuthTimeout
+		cfg.ExternalAuthRevalidate = bootstrap.ExternalAuthRevalidate
+		cfg.ExternalAuthStaleGrace = bootstrap.ExternalAuthStaleGrace
+		cfg.ExternalAuthCACertPath = bootstrap.ExternalAuthCACertPath
+		cfg.ExternalAuthClientCertPath = bootstrap.ExternalAuthClientCertPath
+		cfg.ExternalAuthClientKeyPath = bootstrap.ExternalAuthClientKeyPath
+		cfg.IdentityRevalidateToken = bootstrap.IdentityRevalidateToken
 	}
 	if cfg.RegisterName == "" {
 		cfg.RegisterName = "go-mumble-server"

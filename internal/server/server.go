@@ -102,6 +102,11 @@ func (s *Server) Start(ctx context.Context) error {
 	slog.Info("Mumble UDP listening", "addr", mumbleAddr)
 
 	ms := mumble.NewServer(cfg, s.db, 1, udpConn)
+	if err := ms.IdentityAuthorityStatus(); err != nil {
+		_ = udpConn.Close()
+		_ = tcpLn.Close()
+		return fmt.Errorf("initialize identity authority: %w", err)
+	}
 	getChanMgr := func(serverID uint) *channel.Manager {
 		if serverID == 1 {
 			return ms.ChanManager()
@@ -140,7 +145,7 @@ func (s *Server) Start(ctx context.Context) error {
 		ms.SetVoiceDebug(serverCfg.VoiceDebug)
 		ms.SetContentPolicy(serverCfg.AllowRecording, serverCfg.MaxTextMessageLength, serverCfg.MaxImageMessageLength)
 	}
-	handler := rest.RouterWithMumble(s.db, cfg, s.feFS, &rest.MumbleUserAdapter{Manager: ms.UserManager(), Server: ms}, &rest.MumbleUserActionAdapter{Server: ms, ServerID: 1}, &rest.MumbleChannelCryptoAdapter{Server: ms, ServerID: 1}, getChanMgr, onACLChange, onBanChange, onChannelMutated, onConfigChange)
+	handler := rest.RouterWithMumbleAndIdentity(s.db, cfg, s.feFS, &rest.MumbleUserAdapter{Manager: ms.UserManager(), Server: ms}, &rest.MumbleUserActionAdapter{Server: ms, ServerID: 1}, &rest.MumbleChannelCryptoAdapter{Server: ms, ServerID: 1}, getChanMgr, onACLChange, onBanChange, onChannelMutated, onConfigChange, ms.RevalidateUserNow)
 	s.http = &http.Server{
 		Addr:    restAddr,
 		Handler: handler,
@@ -162,6 +167,10 @@ func (s *Server) Start(ctx context.Context) error {
 
 	g.Go(func() error {
 		return s.udpReadLoop(gctx, udpConn, ms)
+	})
+
+	g.Go(func() error {
+		return ms.StartIdentityRevalidation(gctx)
 	})
 
 	if cfg.Bonjour {

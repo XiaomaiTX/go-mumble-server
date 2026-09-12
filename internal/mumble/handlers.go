@@ -1,6 +1,7 @@
 package mumble
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/tls"
 	"encoding/hex"
@@ -19,6 +20,7 @@ import (
 	"github.com/dchote/go-mumble-server/internal/channel"
 	"github.com/dchote/go-mumble-server/internal/config"
 	"github.com/dchote/go-mumble-server/internal/connection"
+	"github.com/dchote/go-mumble-server/internal/identity"
 	"github.com/dchote/go-mumble-server/internal/user"
 	"github.com/dchote/go-mumble-server/pkg/mumble"
 	mumbleaudio "github.com/dchote/go-mumble-server/pkg/mumble/audio"
@@ -56,6 +58,8 @@ type Server struct {
 	allowRecording atomic.Bool
 	maxTextBytes   atomic.Int64
 	maxImageBytes  atomic.Int64
+	authority      identity.Authority
+	authorityErr   error
 }
 
 // rateWindow is a fixed one-second window counter guarding a per-session message
@@ -426,6 +430,15 @@ func NewServer(cfg *config.Config, db *gorm.DB, serverID uint, udpConn net.Packe
 		conns:         make(map[uint32]*connection.Conn),
 		channelCrypto: make(map[uint32]string),
 		udpConn:       udpConn,
+	}
+	if strings.EqualFold(cfg.AuthMode, "external") {
+		s.authority, s.authorityErr = identity.NewExternalHTTPAuthority(identity.ExternalHTTPConfig{
+			BaseURL: cfg.ExternalAuthURL, ServiceToken: cfg.ExternalAuthServiceToken,
+			Timeout: cfg.ExternalAuthTimeout, CACertPath: cfg.ExternalAuthCACertPath,
+			ClientCertPath: cfg.ExternalAuthClientCertPath, ClientKeyPath: cfg.ExternalAuthClientKeyPath,
+		})
+	} else {
+		s.authority = &localAuthority{server: s}
 	}
 	voiceDebug := cfg.VoiceDebug
 	s.voiceDebug.Store(voiceDebug)
@@ -873,46 +886,44 @@ func (s *Server) handleAuthenticate(msgType protocol.MessageType, payload []byte
 	if s.users.Count() >= s.cfg.MaxUsers && s.cfg.MaxUsers > 0 {
 		return s.sendReject(c, messages.RejectServerFull, "Server full")
 	}
-	var apiUserID uint
-	if s.cfg.ServerPassword != "" {
-		// Server password set: accept server password OR API user password
-		if authMsg.Password != s.cfg.ServerPassword {
-			id, hash, _, found := s.users.LookupAPIUser(authMsg.Username)
-			if !found || !auth.ComparePassword(hash, authMsg.Password) {
-				return s.sendReject(c, messages.RejectWrongServerPW, "Wrong password")
-			}
-			apiUserID = uint(id)
-		}
-	} else if authMsg.Password != "" {
-		// No server password: if client sent password, validate against API users
-		id, hash, _, found := s.users.LookupAPIUser(authMsg.Username)
-		if found {
-			if !auth.ComparePassword(hash, authMsg.Password) {
-				return s.sendReject(c, messages.RejectWrongServerPW, "Wrong password")
-			}
-			apiUserID = uint(id)
+	if s.authorityErr != nil || s.authority == nil {
+		slog.Error("identity authority unavailable", "err", s.authorityErr)
+		return s.sendReject(c, messages.RejectAuthenticatorFail, "Identity service unavailable")
+	}
+	remoteIP := ""
+	if addr != nil {
+		remoteIP, _, _ = net.SplitHostPort(addr.String())
+		if remoteIP == "" {
+			remoteIP = addr.String()
 		}
 	}
-	userID := uint32(0)
-	if apiUserID != 0 {
-		userID = acl.MakeAPIUserID(apiUserID)
-	} else if uid, hash, regCertHash, found := s.lookupRegisteredUser(authMsg.Username); found {
-		if !registeredUserCredentialsValid(hash, regCertHash, authMsg.Password, certHash) {
-			return s.sendReject(c, messages.RejectWrongServerPW, "Wrong password")
-		}
-		userID = uid
+	authResult, err := s.authority.Authenticate(context.Background(), identity.AuthenticateRequest{
+		ServerInstanceID: s.cfg.ExternalAuthServerInstanceID,
+		Username:         authMsg.Username, Password: authMsg.Password,
+		CertificateHash: certHash, RemoteIP: remoteIP,
+	})
+	if err != nil {
+		slog.Warn("identity authentication failed closed", "err", err)
+		return s.sendReject(c, messages.RejectAuthenticatorFail, "Identity service unavailable")
 	}
-	// The SuperUser identity carries immunity from other admins' UserState changes,
-	// so it may only be claimed by a connection that actually proved an account.
-	if authMsg.Username == mumble.SuperUserName && userID == 0 {
-		return s.sendReject(c, messages.RejectWrongUserPW, "SuperUser requires an account")
+	if authResult.Decision != identity.DecisionAllow {
+		return s.sendReject(c, messages.RejectWrongUserPW, "Invalid credentials")
+	}
+	resolved := authResult.Identity
+	if !resolved.Eligible || resolved.Name == "" {
+		return s.sendReject(c, messages.RejectWrongUserPW, "Invalid credentials")
 	}
 	u := mumble.User{
-		UserID:       userID,
-		ChannelID:    s.joinChannelFor(userID),
-		Name:         authMsg.Username,
-		AccessTokens: authMsg.Tokens,
-		IsSuperUser:  authMsg.Username == mumble.SuperUserName,
+		UserID:                  resolved.UserID,
+		ChannelID:               s.joinChannelFor(resolved.UserID),
+		Name:                    resolved.Name,
+		AccessTokens:            sanitizedClientTokens(authMsg.Tokens),
+		ExternalGroups:          append([]string(nil), resolved.Groups...),
+		ExternalIdentity:        s.authority.External(),
+		IdentityVersion:         resolved.IdentityVersion,
+		PolicyVersion:           resolved.PolicyVersion,
+		IdentityLastValidatedAt: time.Now(),
+		IsSuperUser:             resolved.IsSuperUser,
 	}
 	if addr != nil {
 		if host, _, err := net.SplitHostPort(addr.String()); err == nil {
@@ -989,6 +1000,18 @@ func registeredUserCredentialsValid(storedPasswordHash, storedCertHash, provided
 			(strings.HasPrefix(storedPasswordHash, "$2") && auth.ComparePassword(storedPasswordHash, providedPassword))
 	}
 	return certMatches || passwordMatches
+}
+
+func sanitizedClientTokens(tokens []string) []string {
+	result := make([]string, 0, len(tokens))
+	for _, token := range tokens {
+		token = strings.TrimSpace(token)
+		if token == "" {
+			continue
+		}
+		result = append(result, token)
+	}
+	return result
 }
 
 func (s *Server) sendReject(c *connection.Conn, typ messages.RejectType, reason string) error {
@@ -2058,19 +2081,26 @@ func (s *Server) handleQueryUsers(msgType protocol.MessageType, payload []byte, 
 		_ = qu.Unmarshal(payload)
 	}
 	resp := messages.QueryUsers{}
-	for _, sid := range qu.IDs {
-		if u, ok := s.users.Snapshot(sid); ok {
-			resp.Names = append(resp.Names, u.Name)
-		} else {
-			resp.Names = append(resp.Names, "")
+	resolved, err := s.authority.Resolve(context.Background(), identity.ResolveRequest{UserIDs: qu.IDs, Names: qu.Names})
+	if err != nil {
+		resp.Names = make([]string, len(qu.IDs))
+		resp.IDs = make([]uint32, len(qu.Names))
+		_ = c.WriteMessage(protocol.MessageQueryUsers, &resp)
+		return nil
+	}
+	nameByID := make(map[uint32]string, len(resolved))
+	idByName := make(map[string]uint32, len(resolved))
+	for _, item := range resolved {
+		if item.Eligible {
+			nameByID[item.UserID] = item.Name
+			idByName[item.Name] = item.UserID
 		}
 	}
+	for _, userID := range qu.IDs {
+		resp.Names = append(resp.Names, nameByID[userID])
+	}
 	for _, name := range qu.Names {
-		if u, ok := s.users.SnapshotByName(name); ok {
-			resp.IDs = append(resp.IDs, u.SessionID)
-		} else {
-			resp.IDs = append(resp.IDs, 0)
-		}
+		resp.IDs = append(resp.IDs, idByName[name])
 	}
 	_ = c.WriteMessage(protocol.MessageQueryUsers, &resp)
 	return nil

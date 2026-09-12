@@ -1,5 +1,7 @@
 package mumble
 
+import "time"
+
 // VoiceState holds the flags that gate audio routing for a session. These are
 // written from the control (TCP) goroutine and read from the voice (UDP) goroutine,
 // so they are grouped to be copied as a unit under the user manager's lock.
@@ -23,6 +25,13 @@ type User struct {
 	ChannelID    uint32
 	Name         string
 	AccessTokens []string // from Authenticate message, for token groups
+	// ExternalGroups are authority-issued session claims. They are kept
+	// separate from client-supplied AccessTokens so authority claims cannot be forged.
+	ExternalGroups          []string
+	ExternalIdentity        bool
+	IdentityVersion         uint64
+	PolicyVersion           uint64
+	IdentityLastValidatedAt time.Time
 	VoiceState
 	PluginIdentity string
 	PluginContext  []byte
@@ -45,7 +54,6 @@ type User struct {
 	IsSuperUser bool
 }
 
-// SuperUserName is the reserved username carrying SuperUser status. Murmur reserves
-// the same name and requires the superuser password to claim it; this server grants
-// it only to a connection that authenticated as a registered or API user.
+// SuperUserName is reserved. Merely authenticating with this display name never
+// grants SuperUser status; an authority must explicitly return IsSuperUser.
 const SuperUserName = "SuperUser"

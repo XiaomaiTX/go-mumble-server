@@ -126,6 +126,20 @@ components:
       description: JWT token from POST /api/v1/auth/login
 
 paths:
+  /internal/identity/v1/revalidate:
+    post:
+      summary: Trigger an identity revalidation pull
+      description: Internal provider callback. Authenticated with the dedicated identity revalidation bearer token; the request only identifies an existing stable user ID and cannot push claims.
+      operationId: revalidateIdentity
+      responses:
+        '202':
+          description: Revalidation accepted
+        '400':
+          description: Invalid stable user ID
+        '401':
+          description: Invalid provider token
+        '503':
+          description: External identity mode unavailable
   /api/v1/auth/status:
     get:
       summary: Auth status
