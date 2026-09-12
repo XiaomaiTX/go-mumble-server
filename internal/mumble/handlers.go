@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/tls"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"log/slog"
@@ -90,6 +91,13 @@ func rateLimitAllows(limiter *sync.Map, sessionID uint32, perSecond int) bool {
 // HandleUDP processes an incoming UDP voice or ping packet.
 func (s *Server) HandleUDP(addr net.Addr, data []byte) {
 	if s.udpConn == nil {
+		return
+	}
+	// Unencrypted server-list probes are answered before any crypt handling, like
+	// Murmur's Server::udpActivated. Senders here have no session, so falling
+	// through to the trial-decrypt path would only log noise and drop the probe.
+	if reply := s.plainPingReply(data); reply != nil {
+		s.udpConn.WriteTo(reply, addr)
 		return
 	}
 	voiceDebug := s.voiceDebug.Load()
@@ -231,6 +239,103 @@ func (s *Server) HandleUDP(addr net.Addr, data []byte) {
 	target := plain[0] & 0x1F
 	outgoing := rewriteAudioPacket(senderSession, plain)
 	_ = s.router.Route(senderSession, target, outgoing)
+}
+
+// Version reported in server-list ping replies. The legacy format cannot express
+// v2 versions, so both fields carry the same 1.5.0 value in their respective
+// encodings (see Murmur's Version::toLegacyVersion and version_v2 packing).
+const (
+	pingLegacyVersion = uint32(1<<16 | 5<<8)    // 1.5.0 as (major<<16)|(minor<<8)|patch
+	pingVersionV2     = uint64(1<<48 | 5<<32)   // 1.5.0 as major<<48|minor<<32|patch<<16
+	pingHeaderProtobuf = byte(0x01)             // UDPMessageType::Ping, new (1.5+) format
+)
+
+// plainPingReply builds the reply for an unencrypted server-list probe, or returns
+// nil when data is not an extended-information probe. Murmur only answers probes
+// that request extended information (expectExtended); plain echo pings from
+// unknown senders get nothing, which keeps the socket from being a reflection
+// amplifier.
+func (s *Server) plainPingReply(data []byte) []byte {
+	// Legacy (≤1.4) probe: 12 bytes, no header, leading u32 zero.
+	if len(data) == 12 && binary.BigEndian.Uint32(data[0:4]) == 0 {
+		out := make([]byte, 24)
+		binary.BigEndian.PutUint32(out[0:4], pingLegacyVersion)
+		copy(out[4:12], data[4:12]) // timestamp is opaque, echo request bytes verbatim
+		binary.BigEndian.PutUint32(out[12:16], uint32(s.users.Count()))
+		binary.BigEndian.PutUint32(out[16:20], uint32(s.cfg.MaxUsers))
+		binary.BigEndian.PutUint32(out[20:24], uint32(s.cfg.MaxBandwidth))
+		return out
+	}
+	// New (1.5+) probe: header byte plus protobuf MumbleUDP.Ping.
+	if len(data) > 1 && data[0] == pingHeaderProtobuf {
+		return s.protobufPingReply(data[1:])
+	}
+	return nil
+}
+
+// protobufPingReply answers a 1.5+ probe encoded as MumbleUDP.Ping. Only the
+// varint fields of Ping are inspected (timestamp=1, request_extended_information=2);
+// the reply echoes the timestamp and fills server_version_v2=3, user_count=4,
+// max_user_count=5, max_bandwidth_per_user=6.
+func (s *Server) protobufPingReply(body []byte) []byte {
+	var timestamp uint64
+	requestInfo := false
+	for i := 0; i < len(body); {
+		key, n := decodeProtoVarint(body[i:])
+		if n <= 0 || key>>3 == 0 || key&7 != 0 {
+			return nil // malformed or non-varint field: not a probe we can answer
+		}
+		i += n
+		val, n := decodeProtoVarint(body[i:])
+		if n <= 0 {
+			return nil
+		}
+		i += n
+		switch key >> 3 {
+		case 1:
+			timestamp = val
+		case 2:
+			requestInfo = val != 0
+		}
+	}
+	if !requestInfo {
+		return nil
+	}
+	out := make([]byte, 1, 32)
+	out[0] = pingHeaderProtobuf
+	out = appendProtoVarintField(out, 1, timestamp)
+	out = appendProtoVarintField(out, 3, pingVersionV2)
+	out = appendProtoVarintField(out, 4, uint64(s.users.Count()))
+	out = appendProtoVarintField(out, 5, uint64(s.cfg.MaxUsers))
+	out = appendProtoVarintField(out, 6, uint64(s.cfg.MaxBandwidth))
+	return out
+}
+
+// decodeProtoVarint decodes a protobuf base-128 varint, returning its value and
+// the number of bytes consumed, or -1 when the input is truncated or overlong.
+func decodeProtoVarint(b []byte) (uint64, int) {
+	var v uint64
+	for i := 0; i < len(b) && i < 10; i++ {
+		v |= uint64(b[i]&0x7f) << (7 * i)
+		if b[i]&0x80 == 0 {
+			return v, i + 1
+		}
+	}
+	return 0, -1
+}
+
+func appendProtoVarintField(buf []byte, field uint64, v uint64) []byte {
+	buf = appendProtoVarint(buf, field<<3) // wire type 0 (varint)
+	buf = appendProtoVarint(buf, v)
+	return buf
+}
+
+func appendProtoVarint(buf []byte, v uint64) []byte {
+	for v >= 0x80 {
+		buf = append(buf, byte(v)|0x80)
+		v >>= 7
+	}
+	return append(buf, byte(v))
 }
 
 // rewriteAudioPacket converts a client-to-server audio packet into a
