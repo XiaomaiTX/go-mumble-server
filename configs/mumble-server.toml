@@ -30,6 +30,9 @@ max_bandwidth = 72000
 welcome_text = ""
 # Server password (empty = no password)
 server_password = ""
+# Mumble 1.4+ channel listening caps (0 = unlimited)
+# max_listeners_per_channel = 0
+# max_listeners_per_user = 0
 
 [database]
 # SQLite database path

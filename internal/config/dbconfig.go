@@ -33,6 +33,8 @@ type ServerConfigData struct {
 	AllowRecording        bool
 	MaxTextMessageLength  int
 	MaxImageMessageLength int
+	MaxChannelListeners   int
+	MaxListenersPerUser   int
 }
 
 // LoadMetaConfig loads meta_config from DB (row ID 1).
@@ -95,6 +97,8 @@ func LoadServerConfig(db *gorm.DB, serverID uint) (*ServerConfigData, error) {
 		AllowRecording:        sc.AllowRecording,
 		MaxTextMessageLength:  sc.MaxTextMessageLength,
 		MaxImageMessageLength: sc.MaxImageMessageLength,
+		MaxChannelListeners:   sc.MaxChannelListeners,
+		MaxListenersPerUser:   sc.MaxListenersPerUser,
 	}, nil
 }
 
@@ -148,6 +152,8 @@ func ConfigForServer(meta *MetaConfig, server *ServerConfigData, bootstrap *Conf
 		AllowRecording:        server.AllowRecording,
 		MaxTextMessageLength:  server.MaxTextMessageLength,
 		MaxImageMessageLength: server.MaxImageMessageLength,
+		MaxChannelListeners:   server.MaxChannelListeners,
+		MaxListenersPerUser:   server.MaxListenersPerUser,
 	}
 	if bootstrap != nil {
 		cfg.DatabasePath = bootstrap.DatabasePath
@@ -226,6 +232,8 @@ func EnsureServerConfig(db *gorm.DB, serverID uint, cfg *Config) error {
 		AllowRecording:        cfg.AllowRecording,
 		MaxTextMessageLength:  cfg.MaxTextMessageLength,
 		MaxImageMessageLength: cfg.MaxImageMessageLength,
+		MaxChannelListeners:   cfg.MaxChannelListeners,
+		MaxListenersPerUser:   cfg.MaxListenersPerUser,
 	}
 	return db.Create(&sc).Error
 }

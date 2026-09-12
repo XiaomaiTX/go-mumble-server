@@ -49,11 +49,13 @@ type Server struct {
 	// userStateRateLimiter throttles self-targeted UserState, which murmur also
 	// rate-limits because each accepted message fans out to every client.
 	userStateRateLimiter sync.Map // session -> *rateWindow
-	channelCryptoMu      sync.RWMutex
-	channelCrypto        map[uint32]string // channelID -> "legacy"|"lite"|"secure"|"mixed"|""
-	router               *audio.Router
-	udpConn              net.PacketConn
-	voiceDebug           atomic.Bool
+	// listeners tracks Mumble 1.4+ channel-listening state; zero value is usable.
+	listeners       listenerManager
+	channelCryptoMu sync.RWMutex
+	channelCrypto   map[uint32]string // channelID -> "legacy"|"lite"|"secure"|"mixed"|""
+	router          *audio.Router
+	udpConn         net.PacketConn
+	voiceDebug      atomic.Bool
 	// Content policy, held separately from cfg so REST edits take effect without a
 	// restart and without racing the handler goroutines that read them.
 	allowRecording atomic.Bool
@@ -245,9 +247,9 @@ func (s *Server) HandleUDP(addr net.Addr, data []byte) {
 // v2 versions, so both fields carry the same 1.5.0 value in their respective
 // encodings (see Murmur's Version::toLegacyVersion and version_v2 packing).
 const (
-	pingLegacyVersion = uint32(1<<16 | 5<<8)    // 1.5.0 as (major<<16)|(minor<<8)|patch
-	pingVersionV2     = uint64(1<<48 | 5<<32)   // 1.5.0 as major<<48|minor<<32|patch<<16
-	pingHeaderProtobuf = byte(0x01)             // UDPMessageType::Ping, new (1.5+) format
+	pingLegacyVersion  = uint32(1<<16 | 5<<8)  // 1.5.0 as (major<<16)|(minor<<8)|patch
+	pingVersionV2      = uint64(1<<48 | 5<<32) // 1.5.0 as major<<48|minor<<32|patch<<16
+	pingHeaderProtobuf = byte(0x01)            // UDPMessageType::Ping, new (1.5+) format
 )
 
 // plainPingReply builds the reply for an unencrypted server-list probe, or returns
@@ -558,8 +560,9 @@ func NewServer(cfg *config.Config, db *gorm.DB, serverID uint, udpConn net.Packe
 			}
 			return cid
 		},
-		GetUsersInChan:   s.users.SessionIDsInChannel,
-		RouteVoiceTarget: s.routeVoiceTarget,
+		GetUsersInChan:     s.users.SessionIDsInChannel,
+		GetListenersInChan: s.listeners.SessionIDsIn,
+		RouteVoiceTarget:   s.routeVoiceTarget,
 		GetLinkedChans: func(cid uint32) []uint32 {
 			ids := s.chans.LinkedChannelIDs(cid)
 			if len(ids) <= 1 {
@@ -809,6 +812,9 @@ func (s *Server) UnregisterConn(sessionID uint32) {
 	s.addrBySession.Delete(sessionID)
 	s.textRateLimiter.Delete(sessionID)
 	s.userStateRateLimiter.Delete(sessionID)
+	// Listener state dies with the session (no persistence); the UserRemove
+	// broadcast that follows already implies its listening list is gone.
+	s.listeners.RemoveAllFor(sessionID)
 	s.chans.CleanEmptyTempChannels(func(cid uint32) bool {
 		return s.users.CountInChannel(cid) > 0
 	})
@@ -1205,10 +1211,19 @@ func (s *Server) sendSync(c *connection.Conn, u mumble.User) {
 		cs := channelToState(ch)
 		_ = c.WriteMessage(protocol.MessageChannelState, cs)
 	}
-	_ = c.WriteMessage(protocol.MessageUserState, userToState(u))
+	// Listening state rides the roster snapshots so a connecting client can render
+	// every user's monitored channels; volume adjustments stay owner-only, matching
+	// murmur's broadcastListenerVolumeAdjustments=false default. userToState itself
+	// stays pure — the listening list is attached at this call site only.
+	selfState := userToState(u)
+	selfState.ListeningChannelAdd = s.listeners.ChannelsFor(u.SessionID)
+	selfState.ListeningVolumeAdjustment = s.listeners.ListeningVolumes(u.SessionID)
+	_ = c.WriteMessage(protocol.MessageUserState, selfState)
 	for _, ou := range s.users.SnapshotAll() {
 		if ou.SessionID != u.SessionID {
-			_ = c.WriteMessage(protocol.MessageUserState, userToState(ou))
+			state := userToState(ou)
+			state.ListeningChannelAdd = s.listeners.ChannelsFor(ou.SessionID)
+			_ = c.WriteMessage(protocol.MessageUserState, state)
 		}
 	}
 	perms := uint64(s.aclPermissions(acl.SubjectOf(u), s.chans.RootID()))
@@ -1496,16 +1511,31 @@ func (s *Server) handleUserState(msgType protocol.MessageType, payload []byte, c
 		return nil
 	}
 
-	// Self-registration and channel listening are not implemented by this server, so
-	// strip them: applying them silently would misrepresent what happened, and
-	// echoing them unstripped (change 2 below) would announce a state we never
-	// actually established.
+	// Self-registration and temporary access tokens are not implemented by this
+	// server, so strip them: applying them silently would misrepresent what
+	// happened, and echoing them unstripped (change 2 below) would announce a
+	// state we never actually established.
 	us.UserID = 0
 	us.SetFields &^= messages.UserStateSetUserID
 	us.TemporaryAccessTokens = nil
-	us.ListeningChannelAdd = nil
-	us.ListeningChannelRemove = nil
-	us.ListeningVolumeAdjustment = nil
+
+	// Listening fields are repeated and carry no presence bits, so a listening-only
+	// message would be dropped by the has-bit gates below (SetFields==0 and the
+	// handled-fields check). Pull them aside first and run them through their own
+	// path (Mumble 1.4 channel listening, listeners.go).
+	listeningAdd, listeningRemove, listeningVols :=
+		us.ListeningChannelAdd, us.ListeningChannelRemove, us.ListeningVolumeAdjustment
+	us.ListeningChannelAdd, us.ListeningChannelRemove, us.ListeningVolumeAdjustment = nil, nil, nil
+	hasListening := len(listeningAdd) > 0 || len(listeningRemove) > 0 || len(listeningVols) > 0
+
+	// Listening is a self-only preference; like murmur, a message aiming it at
+	// another session is dropped silently rather than partially applied.
+	if hasListening && isAdminOp {
+		return nil
+	}
+	if hasListening {
+		s.applyListening(c, target, listeningAdd, listeningRemove, listeningVols)
+	}
 
 	if us.SetFields == 0 {
 		return nil
@@ -1880,6 +1910,15 @@ func (s *Server) handleChannelRemove(msgType protocol.MessageType, payload []byt
 			state.SetFields |= messages.UserStateSetSuppress
 		}
 		s.Broadcast(0, protocol.MessageUserState, state)
+	}
+	// Listeners learn the channel is gone via a listening_channel_remove delta that
+	// precedes the ChannelRemove broadcast, mirroring murmur's ordering.
+	for _, sid := range s.listeners.RemoveChannel(cr.ChannelID) {
+		s.Broadcast(0, protocol.MessageUserState, &messages.UserState{
+			Session:                sid,
+			SetFields:              messages.UserStateSetSession,
+			ListeningChannelRemove: []uint32{cr.ChannelID},
+		})
 	}
 	// The channel these users were in is going away, and they have all moved.
 	s.invalidateACLCache()

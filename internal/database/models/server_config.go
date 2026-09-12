@@ -20,6 +20,9 @@ type ServerConfig struct {
 	AllowRecording        bool   `gorm:"not null;default:true" json:"allow_recording"`
 	MaxTextMessageLength  int    `gorm:"not null;default:5000" json:"max_text_message_length"`
 	MaxImageMessageLength int    `gorm:"not null;default:131072" json:"max_image_message_length"`
+	// Mumble 1.4+ channel-listening caps; 0 means unlimited.
+	MaxChannelListeners int `gorm:"not null;default:0" json:"max_channel_listeners"`
+	MaxListenersPerUser int `gorm:"not null;default:0" json:"max_listeners_per_user"`
 }
 
 // TableName returns the table name.

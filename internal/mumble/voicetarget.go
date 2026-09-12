@@ -141,8 +141,22 @@ func (s *Server) resolveVoiceTarget(sessionID uint32, targetID uint8) []voiceRec
 			if !canWhisper(cid) {
 				continue
 			}
+			groupAllows := func(u mumble.User) bool {
+				// 组过滤在被监听频道上解析，监听者与占用者同等对待（匹配 murmur）。
+				if target.Group == "" {
+					return true
+				}
+				return s.acl != nil && s.acl.InGroup(u, cid, target.Group)
+			}
 			for _, u := range s.users.SnapshotByChannel(cid) {
-				if target.Group != "" && (s.acl == nil || !s.acl.InGroup(u, cid, target.Group)) {
+				if !groupAllows(u) {
+					continue
+				}
+				add(u)
+			}
+			for _, sid := range s.listeners.SessionIDsIn(cid) {
+				u, ok := s.users.Snapshot(sid)
+				if !ok || !groupAllows(u) {
 					continue
 				}
 				add(u)

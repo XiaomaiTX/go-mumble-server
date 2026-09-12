@@ -13,15 +13,16 @@ type RecipientSender interface {
 
 // RouterConfig configures the audio router.
 type RouterConfig struct {
-	Sender           RecipientSender
-	GetChan          func(sessionID uint32) uint32
-	GetUsersInChan   func(channelID uint32) []uint32
-	GetVoiceTarget   func(sessionID uint32, targetID uint8) []uint32
-	RouteVoiceTarget func(sessionID uint32, targetID uint8, packet []byte) error
-	GetLinkedChans   func(channelID uint32) []uint32
-	FilterRecipient  func(senderSessionID, recipientSessionID uint32) bool
-	CanSenderSpeak   func(senderSessionID uint32) bool
-	VoiceDebug       bool
+	Sender             RecipientSender
+	GetChan            func(sessionID uint32) uint32
+	GetUsersInChan     func(channelID uint32) []uint32
+	GetVoiceTarget     func(sessionID uint32, targetID uint8) []uint32
+	RouteVoiceTarget   func(sessionID uint32, targetID uint8, packet []byte) error
+	GetLinkedChans     func(channelID uint32) []uint32
+	GetListenersInChan func(channelID uint32) []uint32
+	FilterRecipient    func(senderSessionID, recipientSessionID uint32) bool
+	CanSenderSpeak     func(senderSessionID uint32) bool
+	VoiceDebug         bool
 }
 
 // Router forwards voice packets to appropriate recipients.
@@ -79,26 +80,40 @@ func (r *Router) Route(senderSessionID uint32, voiceTarget uint8, decryptedPacke
 				channelIDs = append(channelIDs, cfg.GetLinkedChans(ch)...)
 			}
 			seen := make(map[uint32]bool)
+			consider := func(sid uint32) {
+				if sid == senderSessionID || seen[sid] {
+					return
+				}
+				seen[sid] = true
+				filtered := false
+				if cfg.FilterRecipient != nil && !cfg.FilterRecipient(senderSessionID, sid) {
+					filtered = true
+				}
+				if !filtered {
+					recipients = append(recipients, sid)
+				} else if shouldLog {
+					slog.Info("[VOICE-DEBUG] Route: recipient filtered out",
+						"sender", senderSessionID, "recipient", sid)
+				}
+			}
 			for _, cid := range channelIDs {
 				usersInChan := cfg.GetUsersInChan(cid)
+				var listeners []uint32
+				if cfg.GetListenersInChan != nil {
+					listeners = cfg.GetListenersInChan(cid)
+				}
 				if shouldLog {
 					slog.Info("[VOICE-DEBUG] Route: channel scan",
-						"sender", senderSessionID, "channel", cid, "users_in_channel", usersInChan)
+						"sender", senderSessionID, "channel", cid,
+						"users_in_channel", usersInChan, "listeners", listeners)
 				}
+				// Channel listeners hear the channel like occupants without joining it;
+				// `seen` dedups a recipient who is both present and listening.
 				for _, sid := range usersInChan {
-					if sid != senderSessionID && !seen[sid] {
-						seen[sid] = true
-						filtered := false
-						if cfg.FilterRecipient != nil && !cfg.FilterRecipient(senderSessionID, sid) {
-							filtered = true
-						}
-						if !filtered {
-							recipients = append(recipients, sid)
-						} else if shouldLog {
-							slog.Info("[VOICE-DEBUG] Route: recipient filtered out",
-								"sender", senderSessionID, "recipient", sid)
-						}
-					}
+					consider(sid)
+				}
+				for _, sid := range listeners {
+					consider(sid)
 				}
 			}
 		} else if voiceDebug {

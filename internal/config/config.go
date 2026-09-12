@@ -40,8 +40,13 @@ type Config struct {
 	// MaxTextMessageLength and MaxImageMessageLength bound user-supplied text and
 	// image payloads (chat messages, user comments, avatar textures), matching
 	// murmur's iMaxTextMessageLength / iMaxImageMessageLength. 0 means unlimited.
-	MaxTextMessageLength         int
-	MaxImageMessageLength        int
+	MaxTextMessageLength  int
+	MaxImageMessageLength int
+	// MaxChannelListeners and MaxListenersPerUser cap Mumble 1.4+ channel listening,
+	// matching murmur's iMaxListenersPerChannel / iMaxListenerProxiesPerUser.
+	// 0 means unlimited.
+	MaxChannelListeners          int
+	MaxListenersPerUser          int
 	AuthMode                     string
 	ExternalAuthURL              string
 	ExternalAuthAuthenticatePath string
@@ -69,10 +74,12 @@ type fileConfig struct {
 		Key  string `toml:"key"`
 	} `toml:"tls"`
 	Server struct {
-		MaxUsers       int    `toml:"max_users"`
-		MaxBandwidth   int    `toml:"max_bandwidth"`
-		WelcomeText    string `toml:"welcome_text"`
-		ServerPassword string `toml:"server_password"`
+		MaxUsers               int    `toml:"max_users"`
+		MaxBandwidth           int    `toml:"max_bandwidth"`
+		WelcomeText            string `toml:"welcome_text"`
+		ServerPassword         string `toml:"server_password"`
+		MaxListenersPerChannel int    `toml:"max_listeners_per_channel"`
+		MaxListenersPerUser    int    `toml:"max_listeners_per_user"`
 	} `toml:"server"`
 	Database struct {
 		Path string `toml:"path"`
@@ -129,6 +136,8 @@ func defaults() *Config {
 		AllowRecording:               true,
 		MaxTextMessageLength:         5000,
 		MaxImageMessageLength:        131072,
+		MaxChannelListeners:          0, // unlimited, like murmur's -1
+		MaxListenersPerUser:          0,
 		AuthMode:                     "local",
 		ExternalAuthAuthenticatePath: "/api/internal/mumble/v1/authenticate",
 		ExternalAuthResolvePath:      "/api/internal/mumble/v1/identities/resolve",
@@ -180,6 +189,12 @@ func applyFileConfig(cfg *Config, fc *fileConfig) {
 	}
 	if fc.Server.MaxBandwidth != 0 {
 		cfg.MaxBandwidth = fc.Server.MaxBandwidth
+	}
+	if fc.Server.MaxListenersPerChannel > 0 {
+		cfg.MaxChannelListeners = fc.Server.MaxListenersPerChannel
+	}
+	if fc.Server.MaxListenersPerUser > 0 {
+		cfg.MaxListenersPerUser = fc.Server.MaxListenersPerUser
 	}
 	cfg.WelcomeText = fc.Server.WelcomeText
 	cfg.ServerPassword = fc.Server.ServerPassword
@@ -261,6 +276,16 @@ func applyEnv(cfg *Config) {
 	if v := os.Getenv("MUMBLE_MAX_BANDWIDTH"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			cfg.MaxBandwidth = n
+		}
+	}
+	if v := os.Getenv("MUMBLE_MAX_LISTENERS_PER_CHANNEL"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.MaxChannelListeners = n
+		}
+	}
+	if v := os.Getenv("MUMBLE_MAX_LISTENERS_PER_USER"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.MaxListenersPerUser = n
 		}
 	}
 	if v := os.Getenv("MUMBLE_LOG_LEVEL"); v != "" {
