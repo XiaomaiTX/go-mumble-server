@@ -288,6 +288,43 @@ func TestVoiceRoutesToLinkedChannelListeners(t *testing.T) {
 	}
 }
 
+// A denied linked channel must not receive normal speech, while other channels
+// in the same complete component remain reachable.
+func TestVoiceRoutesLinkedChannelsCheckSpeakPerTarget(t *testing.T) {
+	s := newVoiceTargetTestServer(t)
+	root := s.chans.RootID()
+	aChannel := s.chans.Create(root, "a", "", 0, false, 0)
+	bChannel := s.chans.Create(root, "b-denied", "", 0, false, 0)
+	cChannel := s.chans.Create(root, "c-allowed", "", 0, false, 0)
+	if aChannel == nil || bChannel == nil || cChannel == nil {
+		t.Fatal("create channels")
+	}
+	if _, ok := s.chans.UpdateLinks(aChannel.ID, []uint32{bChannel.ID}); !ok {
+		t.Fatal("link a-b")
+	}
+	if _, ok := s.chans.UpdateLinks(bChannel.ID, []uint32{aChannel.ID, cChannel.ID}); !ok {
+		t.Fatal("link b-c")
+	}
+	denyACL(t, s, bChannel.ID, mumble.PermissionSpeak)
+
+	sender := &mumble.User{Name: "sender", ChannelID: aChannel.ID}
+	connectTestUser(t, s, sender)
+	denied := &mumble.User{Name: "denied", ChannelID: bChannel.ID}
+	_, deniedSide := connectTestUser(t, s, denied)
+	allowed := &mumble.User{Name: "allowed", ChannelID: cChannel.ID}
+	_, allowedSide := connectTestUser(t, s, allowed)
+
+	pkt := []byte{0x80, 0x01, 0xDD}
+	if err := s.router.Route(sender.SessionID, 0, pkt); err != nil {
+		t.Fatal(err)
+	}
+	expectNoBroadcast(t, deniedSide)
+	kind, got := readMessage(t, allowedSide)
+	if kind != protocol.MessageUDPTunnel || !bytes.Equal(got, pkt) {
+		t.Fatalf("allowed target got type=%d packet=%v, want UDPTunnel %v", kind, got, pkt)
+	}
+}
+
 // Whisper/shout channel targets include listeners, and the group restriction
 // filters them exactly like occupants.
 func TestWhisperChannelTargetIncludesListeners(t *testing.T) {

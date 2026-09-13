@@ -515,7 +515,7 @@ func (h *ServerHandler) UpdateChannel(w http.ResponseWriter, r *http.Request) {
 		Position    *int32   `json:"position"`
 		MaxUsers    *uint32  `json:"max_users"`
 		Temporary   *bool    `json:"is_temporary"`
-		Links       []uint32 `json:"links"`
+		Links       *[]uint32 `json:"links"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		http.Error(w, `{"error":"invalid request body"}`, http.StatusBadRequest)
@@ -537,17 +537,28 @@ func (h *ServerHandler) UpdateChannel(w http.ResponseWriter, r *http.Request) {
 	if body.Temporary != nil {
 		opts.Temporary = body.Temporary
 	}
-	if body.Links != nil {
-		opts.Links = body.Links
-	}
 	mgr := h.chanManager(uint(serverID))
-	if !mgr.Update(uint32(chID), opts) {
+	if (body.Name != nil || body.Description != nil || body.Position != nil || body.MaxUsers != nil || body.Temporary != nil) && !mgr.Update(uint32(chID), opts) {
 		http.Error(w, `{"error":"channel not found or update failed"}`, http.StatusNotFound)
 		return
 	}
 	if h.onChannelMutated != nil {
 		if ch, ok := mgr.GetChannel(uint32(chID)); ok {
 			h.onChannelMutated(uint(serverID), ch, uint32(chID), false)
+		}
+	}
+	if body.Links != nil {
+		changed, ok := mgr.UpdateLinks(uint32(chID), *body.Links)
+		if !ok {
+			http.Error(w, `{"error":"invalid channel links"}`, http.StatusBadRequest)
+			return
+		}
+		if h.onChannelMutated != nil {
+			for _, changedID := range changed {
+				if ch, ok := mgr.GetChannel(changedID); ok {
+					h.onChannelMutated(uint(serverID), ch, changedID, false)
+				}
+			}
 		}
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -588,6 +599,7 @@ type ChannelNode struct {
 	Position    int32         `json:"position"`
 	MaxUsers    uint32        `json:"max_users"`
 	IsTemporary bool          `json:"is_temporary"`
+	Links       []uint        `json:"links"`
 	CryptoMode  string        `json:"crypto_mode,omitempty"`
 	Children    []ChannelNode `json:"children,omitempty"`
 }
@@ -605,6 +617,7 @@ func buildChannelTree(channels []models.Channel, parentID *uint, cryptoModes map
 				Position:    c.Position,
 				MaxUsers:    c.MaxUsers,
 				IsTemporary: c.IsTemporary,
+				Links:       append([]uint(nil), c.Links...),
 				CryptoMode:  cryptoModes[uint32(c.ID)],
 				Children:    buildChannelTree(channels, ptr(c.ID), cryptoModes),
 			}

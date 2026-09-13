@@ -145,7 +145,9 @@ func TestVoiceTargetDynamicLinksChildrenGroups(t *testing.T) {
 	s.chans.Update(ch.ID, channel.UpdateOpts{Links: []uint32{linked.ID}})
 	s.chans.Update(linked.ID, channel.UpdateOpts{Links: []uint32{end.ID, ch.ID}})
 	assertVoiceRecipients(t, s, a.SessionID, b.SessionID, c.SessionID)
-	s.chans.Update(ch.ID, channel.UpdateOpts{Links: []uint32{}})
+	if _, ok := s.chans.UpdateLinks(ch.ID, nil); !ok {
+		t.Fatal("unlink channels")
+	}
 	assertVoiceRecipients(t, s, a.SessionID, b.SessionID)
 	target.Group = "#secret"
 	setVoiceTarget(t, s, ac, target)

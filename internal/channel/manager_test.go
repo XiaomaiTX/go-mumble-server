@@ -133,6 +133,67 @@ func TestGetChannel_ReturnsACopy(t *testing.T) {
 	}
 }
 
+func TestConnectedChannelIDs_TraversesUndirectedLegacyLinks(t *testing.T) {
+	m := NewManager(newTestDB(t), 1)
+	a := m.Create(m.RootID(), "a", "", 0, false, 0)
+	b := m.Create(m.RootID(), "b", "", 0, false, 0)
+	c := m.Create(m.RootID(), "c", "", 0, false, 0)
+	if a == nil || b == nil || c == nil {
+		t.Fatal("create channels")
+	}
+	// Simulate a database written by the old one-sided implementation.
+	if !m.Update(a.ID, UpdateOpts{Links: []uint32{b.ID}}) ||
+		!m.Update(b.ID, UpdateOpts{Links: []uint32{c.ID}}) {
+		t.Fatal("seed legacy links")
+	}
+	for _, start := range []uint32{a.ID, b.ID, c.ID} {
+		got := m.ConnectedChannelIDs(start)
+		want := []uint32{a.ID, b.ID, c.ID}
+		if len(got) != len(want) {
+			t.Fatalf("component from %d = %v, want %v", start, got, want)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Fatalf("component from %d = %v, want %v", start, got, want)
+			}
+		}
+	}
+}
+
+func TestUpdateLinks_KeepsBothSidesAndPersists(t *testing.T) {
+	db := newTestDB(t)
+	m := NewManager(db, 1)
+	a := m.Create(m.RootID(), "a", "", 0, false, 0)
+	b := m.Create(m.RootID(), "b", "", 0, false, 0)
+	if a == nil || b == nil {
+		t.Fatal("create channels")
+	}
+	if changed, ok := m.UpdateLinks(a.ID, []uint32{b.ID}); !ok || len(changed) != 2 {
+		t.Fatalf("link changed=%v ok=%v", changed, ok)
+	}
+	for _, id := range []uint32{a.ID, b.ID} {
+		ch, ok := m.GetChannel(id)
+		if !ok || len(ch.Links) != 1 {
+			t.Fatalf("channel %d links = %+v", id, ch)
+		}
+	}
+	m = NewManager(db, 1)
+	linkedA, _ := m.GetChannel(a.ID)
+	linkedB, _ := m.GetChannel(b.ID)
+	if len(linkedA.Links) != 1 || linkedA.Links[0] != b.ID ||
+		len(linkedB.Links) != 1 || linkedB.Links[0] != a.ID {
+		t.Fatalf("links after reload: a=%v b=%v", linkedA.Links, linkedB.Links)
+	}
+	if _, ok := m.UpdateLinks(a.ID, nil); !ok {
+		t.Fatal("unlink")
+	}
+	linkedA, _ = m.GetChannel(a.ID)
+	linkedB, _ = m.GetChannel(b.ID)
+	if len(linkedA.Links) != 0 || len(linkedB.Links) != 0 {
+		t.Fatalf("links after unlink: a=%v b=%v", linkedA.Links, linkedB.Links)
+	}
+}
+
 // ACL inheritance walks this chain, so it has to reach root. Every direct child of
 // root reports ParentID 0 — the same value root itself reports — which makes the
 // terminating condition easy to get wrong and silently drops root's ACLs.

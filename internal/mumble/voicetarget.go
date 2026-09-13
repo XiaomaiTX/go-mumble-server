@@ -120,16 +120,8 @@ func (s *Server) resolveVoiceTarget(sessionID uint32, targetID uint8) []voiceRec
 		}
 		channels := map[uint32]bool{target.ChannelID: true}
 		if target.Links {
-			queue := []uint32{target.ChannelID}
-			for len(queue) > 0 {
-				cid := queue[0]
-				queue = queue[1:]
-				for _, id := range s.chans.LinkedChannelIDs(cid) {
-					if !channels[id] {
-						channels[id] = true
-						queue = append(queue, id)
-					}
-				}
+			for _, id := range s.chans.ConnectedChannelIDs(target.ChannelID) {
+				channels[id] = true
 			}
 		}
 		if target.Children {

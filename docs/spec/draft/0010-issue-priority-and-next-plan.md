@@ -31,7 +31,7 @@ GitHub 当前有 26 个开放 Issue，另有 [#27](https://github.com/XiaomaiTX/
 | [#3](https://github.com/XiaomaiTX/go-mumble-server/issues/3) | ACL Traverse、Write、root-only 语义 | 仍有效，可能造成权限扩大或权限判断错误 | 重构 Murmur 风格的权限计算状态机，并增加根权限与子频道测试 |
 | [#4](https://github.com/XiaomaiTX/go-mumble-server/issues/4) | Group selector、Token、证书语义 | 仍有效，可能让错误用户匹配到 ACL Group | 补齐官方 selector、Token 大小写、`sub` 参数和临时成员语义 |
 | [#5](https://github.com/XiaomaiTX/go-mumble-server/issues/5) | Group 继承优先级 | 仍有效，子频道 remove 可能被父级 add 覆盖 | 按 root 到目标频道的顺序重算，并覆盖 `inherit/inheritable` 组合 |
-| [#7](https://github.com/XiaomaiTX/go-mumble-server/issues/7) | Linked Channel 目标频道 Speak 检查 | 仍是音频权限绕过风险 | 对每个目标频道单独检查发送者 Speak 权限 |
+| [#7](https://github.com/XiaomaiTX/go-mumble-server/issues/7) | Linked Channel 目标频道 Speak 检查 | 已实现，待关闭 Issue | 对每个目标频道单独检查发送者 Speak 权限 |
 | [#8](https://github.com/XiaomaiTX/go-mumble-server/issues/8) | BanList 查询权限 | 仍可能向普通用户泄露 IP、证书 hash 和封禁原因 | 查询和更新入口统一检查 root Ban 权限 |
 | [#10](https://github.com/XiaomaiTX/go-mumble-server/issues/10) | Tree TextMessage 子频道权限 | 仍可能绕过 descendant channel 的 TextMessage deny | 按每个实际目标频道独立检查权限 |
 
@@ -44,10 +44,10 @@ P0 项应先于新协议功能和管理界面功能处理。#3～#5 应作为同
 | Issue | 主题 | 当前判断 | 执行要求 |
 | --- | --- | --- | --- |
 | [#2](https://github.com/XiaomaiTX/go-mumble-server/issues/2) | VoiceTarget 发言者、接收者和 Whisper 权限 | 核心缺口已修，原 P0 标题过期 | 补齐与 Murmur 的回归测试；确认后关闭或改为兼容性验证项 |
-| [#6](https://github.com/XiaomaiTX/go-mumble-server/issues/6) | Linked Channel 完整连通图 | 普通语音仍主要只走一跳；VoiceTarget `links=true` 已自行 BFS | 统一正常语音和 Whisper 的 connected-component 遍历 |
+| [#6](https://github.com/XiaomaiTX/go-mumble-server/issues/6) | Linked Channel 完整连通图 | 已实现，待关闭 Issue | 正常语音、Whisper 和相关路径共用 connected-component 遍历 |
 | [#9](https://github.com/XiaomaiTX/go-mumble-server/issues/9) | 空 BanList 清空全部封禁 | 仍有效 | `query=false` 时始终执行 replace，包括空数组 |
 | [#11](https://github.com/XiaomaiTX/go-mumble-server/issues/11) | Temporary Channel 生命周期 | 对官方客户端兼容属于 P1；受控 EVE 部署可降为 P2 | 临时频道不持久化，最后一个用户离开后按官方规则清理，重启不恢复 |
-| [#14](https://github.com/XiaomaiTX/go-mumble-server/issues/14) | LinkChannel 权限 | 当前主要检查 Write，存在链接权限扩大风险 | 按官方 LinkChannel 规则分别检查链接两侧并同步内存与数据库 |
+| [#14](https://github.com/XiaomaiTX/go-mumble-server/issues/14) | LinkChannel 权限 | 已实现，待关闭 Issue | 按官方 LinkChannel 规则分别检查链接两侧并同步内存与数据库 |
 | [#22](https://github.com/XiaomaiTX/go-mumble-server/issues/22) | Mumble 1.5 Protobuf UDP Audio | 以官方 1.5.x 兼容为目标时属于 P1；Legacy-only 部署可降为 P2 | 完成 Audio 编解码、模式选择、sender session、target/context 和转发测试 |
 | [#23](https://github.com/XiaomaiTX/go-mumble-server/issues/23) | VersionV1/VersionV2 协商 | 必须依赖 #22，不能单独提前修复 | #22 完成并通过互操作测试后，再宣告对应协议能力 |
 
@@ -89,6 +89,8 @@ ACL/Group 基础语义
 ```
 
 其中 #6 与 #7 应共享同一个 linked-channel connected-component 实现；#8 与 #9 应共享同一个 BanList replace 流程。
+
+#6、#7 与 #14 的现状边界、实施切分和验收矩阵见 [0012 Linked Channel 修复计划](0012-linked-channel-fix-plan.md)。
 
 ## 四、下一阶段实施计划
 

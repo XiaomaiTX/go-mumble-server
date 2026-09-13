@@ -443,7 +443,15 @@ func (s *Server) canSenderSpeak(sessionID uint32) bool {
 	if g.Mute || g.Suppress || g.SelfMute {
 		return false
 	}
-	return s.aclCheck(acl.Subject{SessionID: sessionID, UserID: g.UserID}, g.ChannelID, mumble.PermissionSpeak)
+	return true
+}
+
+func (s *Server) canSenderSpeakInChannel(sessionID, channelID uint32) bool {
+	g, ok := s.users.SpeakGateFor(sessionID)
+	if !ok || g.Mute || g.Suppress || g.SelfMute {
+		return false
+	}
+	return s.aclCheck(acl.Subject{SessionID: sessionID, UserID: g.UserID}, channelID, mumble.PermissionSpeak)
 }
 
 func (s *Server) audioFilterRecipient(senderSessionID, recipientSessionID uint32) bool {
@@ -493,10 +501,7 @@ func (s *Server) UpdateChannelCrypto(channelID uint32) {
 func (s *Server) channelHasMixedCrypto(channelID uint32) bool {
 	allModes := make(map[string]bool)
 
-	channelIDs := []uint32{channelID}
-	if linked := s.chans.LinkedChannelIDs(channelID); len(linked) > 1 {
-		channelIDs = append(channelIDs, linked[1:]...)
-	}
+	channelIDs := s.chans.ConnectedChannelIDs(channelID)
 
 	s.channelCryptoMu.RLock()
 	for _, cid := range channelIDs {
@@ -574,15 +579,19 @@ func NewServer(cfg *config.Config, db *gorm.DB, serverID uint, udpConn net.Packe
 		GetListenersInChan: s.listeners.SessionIDsIn,
 		RouteVoiceTarget:   s.routeVoiceTarget,
 		GetLinkedChans: func(cid uint32) []uint32 {
-			ids := s.chans.LinkedChannelIDs(cid)
-			if len(ids) <= 1 {
-				return nil
+			ids := s.chans.ConnectedChannelIDs(cid)
+			out := make([]uint32, 0, len(ids))
+			for _, id := range ids {
+				if id != cid {
+					out = append(out, id)
+				}
 			}
-			return ids[1:]
+			return out
 		},
-		FilterRecipient: s.audioFilterRecipient,
-		CanSenderSpeak:  s.canSenderSpeak,
-		VoiceDebug:      voiceDebug,
+		FilterRecipient:      s.audioFilterRecipient,
+		CanSenderSpeak:       s.canSenderSpeak,
+		CanSenderSpeakInChan: s.canSenderSpeakInChannel,
+		VoiceDebug:           voiceDebug,
 	})
 	s.registerHandlers()
 	return s
@@ -1834,35 +1843,98 @@ func (s *Server) handleChannelState(msgType protocol.MessageType, payload []byte
 		return nil
 	}
 	opts := channel.UpdateOpts{}
+	hasMetadataChange := false
 	if cs.Name != "" {
 		opts.Name = &cs.Name
+		hasMetadataChange = true
 	}
 	if cs.Description != "" {
 		opts.Description = &cs.Description
+		hasMetadataChange = true
 	}
 	if cs.Position != 0 {
 		opts.Position = &cs.Position
+		hasMetadataChange = true
 	}
 	if cs.MaxUsers != 0 {
 		opts.MaxUsers = &cs.MaxUsers
+		hasMetadataChange = true
 	}
-	opts.Temporary = &cs.Temporary
+	if cs.Temporary {
+		opts.Temporary = &cs.Temporary
+		hasMetadataChange = true
+	}
+
+	ch, exists := s.chans.GetChannel(cs.ChannelID)
+	if !exists {
+		return nil
+	}
+	desiredLinks := make(map[uint32]bool, len(ch.Links))
+	for _, id := range ch.Links {
+		desiredLinks[id] = true
+	}
+	originalLinks := make(map[uint32]bool, len(desiredLinks))
+	for id := range desiredLinks {
+		originalLinks[id] = true
+	}
+	hasLinkChange := len(cs.Links) > 0 || len(cs.LinksAdd) > 0 || len(cs.LinksRemove) > 0
 	if len(cs.Links) > 0 {
-		opts.Links = cs.Links
+		desiredLinks = make(map[uint32]bool, len(cs.Links))
+		for _, id := range cs.Links {
+			desiredLinks[id] = true
+		}
 	}
-	if len(cs.LinksAdd) > 0 {
-		opts.LinksAdd = cs.LinksAdd
+	for _, id := range cs.LinksAdd {
+		desiredLinks[id] = true
 	}
-	if len(cs.LinksRemove) > 0 {
-		opts.LinksRemove = cs.LinksRemove
+	for _, id := range cs.LinksRemove {
+		delete(desiredLinks, id)
 	}
-	if !s.aclCheck(acl.SubjectOf(u), cs.ChannelID, mumble.PermissionWrite) {
+	if hasMetadataChange && !s.aclCheck(acl.SubjectOf(u), cs.ChannelID, mumble.PermissionWrite) {
 		_ = c.WriteMessage(protocol.MessagePermissionDenied, &messages.PermissionDenied{ChannelID: cs.ChannelID, Type: messages.DenyPermission})
 		return nil
 	}
-	if s.chans.Update(cs.ChannelID, opts) {
-		if ch, ok := s.chans.GetChannel(cs.ChannelID); ok {
-			s.Broadcast(0, protocol.MessageChannelState, channelToState(ch))
+	if hasLinkChange {
+		for id := range desiredLinks {
+			if originalLinks[id] {
+				continue
+			}
+			if id == cs.ChannelID || !s.aclCheck(acl.SubjectOf(u), cs.ChannelID, mumble.PermissionLinkChannel) ||
+				!s.aclCheck(acl.SubjectOf(u), id, mumble.PermissionLinkChannel) {
+				_ = c.WriteMessage(protocol.MessagePermissionDenied, &messages.PermissionDenied{ChannelID: cs.ChannelID, Type: messages.DenyPermission})
+				return nil
+			}
+		}
+		for _, id := range ch.Links {
+			if desiredLinks[id] {
+				continue
+			}
+			if !s.aclCheck(acl.SubjectOf(u), cs.ChannelID, mumble.PermissionLinkChannel) &&
+				!s.aclCheck(acl.SubjectOf(u), id, mumble.PermissionLinkChannel) {
+				_ = c.WriteMessage(protocol.MessagePermissionDenied, &messages.PermissionDenied{ChannelID: cs.ChannelID, Type: messages.DenyPermission})
+				return nil
+			}
+		}
+	}
+	if hasMetadataChange && s.chans.Update(cs.ChannelID, opts) {
+		if updated, ok := s.chans.GetChannel(cs.ChannelID); ok {
+			s.Broadcast(0, protocol.MessageChannelState, channelToState(updated))
+		}
+	}
+	if hasLinkChange {
+		desired := make([]uint32, 0, len(desiredLinks))
+		for id := range desiredLinks {
+			desired = append(desired, id)
+		}
+		changed, updated := s.chans.UpdateLinks(cs.ChannelID, desired)
+		if !updated {
+			_ = c.WriteMessage(protocol.MessagePermissionDenied, &messages.PermissionDenied{ChannelID: cs.ChannelID, Type: messages.DenyPermission})
+			return nil
+		}
+		for _, id := range changed {
+			if linked, ok := s.chans.GetChannel(id); ok {
+				s.Broadcast(0, protocol.MessageChannelState, channelToState(linked))
+			}
 		}
 	}
 	return nil

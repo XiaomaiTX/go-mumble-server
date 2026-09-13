@@ -13,16 +13,17 @@ type RecipientSender interface {
 
 // RouterConfig configures the audio router.
 type RouterConfig struct {
-	Sender             RecipientSender
-	GetChan            func(sessionID uint32) uint32
-	GetUsersInChan     func(channelID uint32) []uint32
-	GetVoiceTarget     func(sessionID uint32, targetID uint8) []uint32
-	RouteVoiceTarget   func(sessionID uint32, targetID uint8, packet []byte) error
-	GetLinkedChans     func(channelID uint32) []uint32
-	GetListenersInChan func(channelID uint32) []uint32
-	FilterRecipient    func(senderSessionID, recipientSessionID uint32) bool
-	CanSenderSpeak     func(senderSessionID uint32) bool
-	VoiceDebug         bool
+	Sender               RecipientSender
+	GetChan              func(sessionID uint32) uint32
+	GetUsersInChan       func(channelID uint32) []uint32
+	GetVoiceTarget       func(sessionID uint32, targetID uint8) []uint32
+	RouteVoiceTarget     func(sessionID uint32, targetID uint8, packet []byte) error
+	GetLinkedChans       func(channelID uint32) []uint32
+	GetListenersInChan   func(channelID uint32) []uint32
+	FilterRecipient      func(senderSessionID, recipientSessionID uint32) bool
+	CanSenderSpeak       func(senderSessionID uint32) bool
+	CanSenderSpeakInChan func(senderSessionID, channelID uint32) bool
+	VoiceDebug           bool
 }
 
 // Router forwards voice packets to appropriate recipients.
@@ -97,6 +98,13 @@ func (r *Router) Route(senderSessionID uint32, voiceTarget uint8, decryptedPacke
 				}
 			}
 			for _, cid := range channelIDs {
+				if cfg.CanSenderSpeakInChan != nil && !cfg.CanSenderSpeakInChan(senderSessionID, cid) {
+					if shouldLog {
+						slog.Info("[VOICE-DEBUG] Route: sender cannot speak in channel, skipping",
+							"sender", senderSessionID, "channel", cid)
+					}
+					continue
+				}
 				usersInChan := cfg.GetUsersInChan(cid)
 				var listeners []uint32
 				if cfg.GetListenersInChan != nil {

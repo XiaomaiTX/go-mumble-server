@@ -421,6 +421,159 @@ func (m *Manager) LinkedChannelIDs(channelID uint32) []uint32 {
 	return out
 }
 
+// ConnectedChannelIDs returns the complete linked-channel component containing
+// channelID. Links are interpreted as undirected here so a legacy one-sided
+// database row cannot make voice routing depend on the direction of traversal.
+// The result is sorted and is always a private slice.
+func (m *Manager) ConnectedChannelIDs(channelID uint32) []uint32 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if _, ok := m.tree[channelID]; !ok {
+		return nil
+	}
+	adjacent := make(map[uint32][]uint32, len(m.tree))
+	for id, node := range m.tree {
+		for _, linkedID := range node.Links {
+			if linkedID == id || m.tree[linkedID] == nil {
+				continue
+			}
+			adjacent[id] = append(adjacent[id], linkedID)
+			adjacent[linkedID] = append(adjacent[linkedID], id)
+		}
+	}
+	seen := map[uint32]bool{channelID: true}
+	queue := []uint32{channelID}
+	for len(queue) > 0 {
+		id := queue[0]
+		queue = queue[1:]
+		for _, linkedID := range adjacent[id] {
+			if !seen[linkedID] {
+				seen[linkedID] = true
+				queue = append(queue, linkedID)
+			}
+		}
+	}
+	out := make([]uint32, 0, len(seen))
+	for id := range seen {
+		out = append(out, id)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
+}
+
+// UpdateLinks replaces channelID's direct links and keeps every affected edge
+// bidirectional in both memory and the database. Callers must authorize each
+// addition or removal before calling it. On failure no in-memory state changes.
+func (m *Manager) UpdateLinks(channelID uint32, desired []uint32) (changed []uint32, ok bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	node := m.tree[channelID]
+	if node == nil {
+		return nil, false
+	}
+	desiredSet := make(map[uint32]bool, len(desired))
+	for _, linkedID := range desired {
+		if linkedID == channelID || m.tree[linkedID] == nil {
+			return nil, false
+		}
+		desiredSet[linkedID] = true
+	}
+	oldSet := make(map[uint32]bool, len(node.Links))
+	for _, linkedID := range node.Links {
+		if linkedID != channelID && m.tree[linkedID] != nil {
+			oldSet[linkedID] = true
+		}
+	}
+	changedSet := map[uint32]bool{channelID: true}
+	for id := range oldSet {
+		changedSet[id] = true
+	}
+	for id := range desiredSet {
+		changedSet[id] = true
+	}
+	// Include stale inbound edges as well. This repairs legacy one-sided rows
+	// whenever this channel's links are next updated.
+	for id, candidate := range m.tree {
+		for _, linkedID := range candidate.Links {
+			if linkedID == channelID {
+				changedSet[id] = true
+				break
+			}
+		}
+	}
+	stable := len(oldSet) == len(desiredSet)
+	for id := range oldSet {
+		stable = stable && desiredSet[id]
+	}
+	for id, candidate := range m.tree {
+		if id == channelID {
+			continue
+		}
+		hasInbound := false
+		for _, linkedID := range candidate.Links {
+			if linkedID == channelID {
+				hasInbound = true
+				break
+			}
+		}
+		if hasInbound != desiredSet[id] {
+			stable = false
+			break
+		}
+	}
+	if stable {
+		return nil, true
+	}
+
+	updated := make(map[uint32][]uint32, len(changedSet))
+	for id := range changedSet {
+		links := make(map[uint32]bool)
+		for _, linkedID := range m.tree[id].Links {
+			if linkedID != id && m.tree[linkedID] != nil {
+				links[linkedID] = true
+			}
+		}
+		if id == channelID {
+			links = desiredSet
+		} else {
+			delete(links, channelID)
+			if desiredSet[id] {
+				links[channelID] = true
+			}
+		}
+		updated[id] = sortedLinkIDs(links)
+	}
+	tx := m.db.Begin()
+	if tx.Error != nil {
+		return nil, false
+	}
+	for id, links := range updated {
+		if err := tx.Model(&models.Channel{}).Where("id = ? AND server_id = ?", id, m.serverID).
+			Update("links", models.Uint32Slice(links)).Error; err != nil {
+			tx.Rollback()
+			return nil, false
+		}
+	}
+	if err := tx.Commit().Error; err != nil {
+		return nil, false
+	}
+	for id, links := range updated {
+		m.tree[id].Links = links
+		changed = append(changed, id)
+	}
+	sort.Slice(changed, func(i, j int) bool { return changed[i] < changed[j] })
+	return changed, true
+}
+
+func sortedLinkIDs(set map[uint32]bool) []uint32 {
+	out := make([]uint32, 0, len(set))
+	for id := range set {
+		out = append(out, id)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
+}
+
 // SubtreeIDs returns all channel IDs in the subtree rooted at id (including id).
 func (m *Manager) SubtreeIDs(id uint32) []uint32 {
 	m.mu.RLock()
