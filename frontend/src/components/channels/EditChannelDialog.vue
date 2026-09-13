@@ -47,6 +47,22 @@
         autocomplete="off"
         class="mb-4"
       />
+      <v-select
+        v-model="form.links"
+        :items="linkOptions"
+        item-title="name"
+        item-value="id"
+        label="Linked channels"
+        multiple
+        chips
+        closable-chips
+        variant="outlined"
+        density="compact"
+        hide-details="auto"
+        class="mb-4"
+        hint="Audio is shared across linked channels"
+        persistent-hint
+      />
       <v-checkbox
         v-model="form.is_temporary"
         label="Temporary channel"
@@ -66,7 +82,7 @@
 </template>
 
 <script setup>
-import { ref, watch } from 'vue'
+import { ref, watch, computed } from 'vue'
 import StandardDialog from '@/components/common/StandardDialog.vue'
 import api from '@/utils/api'
 
@@ -74,6 +90,7 @@ const props = defineProps({
   modelValue: { type: Boolean, default: false },
   serverId: { type: [String, Number], required: true },
   channel: { type: Object, default: null },
+  channels: { type: Array, default: () => [] },
 })
 const emit = defineEmits(['update:modelValue', 'updated'])
 
@@ -87,9 +104,22 @@ const form = ref({
   position: 0,
   max_users: 0,
   is_temporary: false,
+  links: [],
 })
 const loading = ref(false)
 const error = ref('')
+
+const linkOptions = computed(() => {
+  const out = []
+  const add = (channels) => {
+    for (const ch of channels || []) {
+      if (ch.id !== props.channel?.id) out.push({ id: ch.id, name: ch.name || `Channel ${ch.id}` })
+      add(ch.children)
+    }
+  }
+  add(props.channels)
+  return out
+})
 
 watch([() => props.modelValue, () => props.channel], ([open, ch]) => {
   if (open && ch) {
@@ -99,6 +129,7 @@ watch([() => props.modelValue, () => props.channel], ([open, ch]) => {
       position: ch.position ?? 0,
       max_users: ch.max_users ?? 0,
       is_temporary: ch.is_temporary ?? false,
+      links: (ch.links || []).map(Number),
     }
     error.value = ''
   }
@@ -124,6 +155,7 @@ async function handleSubmit() {
       position: form.value.position ?? 0,
       max_users: form.value.max_users ?? 0,
       is_temporary: form.value.is_temporary,
+      links: form.value.links.map(Number),
     })
     emit('updated')
     model.value = false

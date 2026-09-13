@@ -134,6 +134,7 @@
         v-model="showEditChannelDialog"
         :server-id="serverId"
         :channel="editingChannel"
+        :channels="channelTree"
         @updated="loadChannels"
       />
       <ACLDialog v-model="showACLDialog" :server-id="serverId" :channel="aclChannel" />

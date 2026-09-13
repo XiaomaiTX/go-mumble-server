@@ -46,7 +46,7 @@
         <p v-else class="text-body-2 text-medium-emphasis">No subchannels. Add one or use the server page to manage the full tree.</p>
       </template>
 
-      <EditChannelDialog v-model="showEditDialog" :server-id="serverId" :channel="channel" @updated="loadChannel" />
+      <EditChannelDialog v-model="showEditDialog" :server-id="serverId" :channel="channel" :channels="channelTree" @updated="loadChannel" />
       <CreateChannelDialog
         v-model="showCreateDialog"
         :server-id="serverId"

@@ -245,6 +245,8 @@ volumes:
 
 功能:服务器状态仪表板、频道树管理、已连接用户列表、ACL 编辑器、封禁列表管理、服务器配置和虚拟服务器控制。
 
+管理员、频道 ACL、`local`/`external` 身份模式和频道链接的操作说明见[管理员与频道权限说明](docs/permissions-and-admin-guide.md)。
+
 可通过 `-frontend-embed=false` 在运行时禁用前端,适用于 headless/仅 API 部署。
 
 ## REST API

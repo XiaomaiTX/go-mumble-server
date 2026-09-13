@@ -510,11 +510,11 @@ func (h *ServerHandler) UpdateChannel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		Name        *string  `json:"name"`
-		Description *string  `json:"description"`
-		Position    *int32   `json:"position"`
-		MaxUsers    *uint32  `json:"max_users"`
-		Temporary   *bool    `json:"is_temporary"`
+		Name        *string   `json:"name"`
+		Description *string   `json:"description"`
+		Position    *int32    `json:"position"`
+		MaxUsers    *uint32   `json:"max_users"`
+		Temporary   *bool     `json:"is_temporary"`
 		Links       *[]uint32 `json:"links"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -538,6 +538,10 @@ func (h *ServerHandler) UpdateChannel(w http.ResponseWriter, r *http.Request) {
 		opts.Temporary = body.Temporary
 	}
 	mgr := h.chanManager(uint(serverID))
+	if _, ok := mgr.GetChannel(uint32(chID)); !ok {
+		http.Error(w, `{"error":"channel not found"}`, http.StatusNotFound)
+		return
+	}
 	if (body.Name != nil || body.Description != nil || body.Position != nil || body.MaxUsers != nil || body.Temporary != nil) && !mgr.Update(uint32(chID), opts) {
 		http.Error(w, `{"error":"channel not found or update failed"}`, http.StatusNotFound)
 		return
@@ -599,7 +603,7 @@ type ChannelNode struct {
 	Position    int32         `json:"position"`
 	MaxUsers    uint32        `json:"max_users"`
 	IsTemporary bool          `json:"is_temporary"`
-	Links       []uint        `json:"links"`
+	Links       []uint32      `json:"links"`
 	CryptoMode  string        `json:"crypto_mode,omitempty"`
 	Children    []ChannelNode `json:"children,omitempty"`
 }
@@ -617,7 +621,7 @@ func buildChannelTree(channels []models.Channel, parentID *uint, cryptoModes map
 				Position:    c.Position,
 				MaxUsers:    c.MaxUsers,
 				IsTemporary: c.IsTemporary,
-				Links:       append([]uint(nil), c.Links...),
+				Links:       append([]uint32(nil), c.Links...),
 				CryptoMode:  cryptoModes[uint32(c.ID)],
 				Children:    buildChannelTree(channels, ptr(c.ID), cryptoModes),
 			}
