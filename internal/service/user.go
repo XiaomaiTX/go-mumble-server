@@ -21,9 +21,11 @@ var (
 
 // UserService handles user business logic.
 type UserService struct {
-	db   *gorm.DB
-	cfg  *config.Config
-	auth *auth.Config
+	// OnAuthorizationChange 在角色变更或账号删除提交后调用；启动时设置。
+	OnAuthorizationChange func()
+	db                    *gorm.DB
+	cfg                   *config.Config
+	auth                  *auth.Config
 }
 
 // NewUserService creates a UserService.
@@ -226,7 +228,7 @@ func (s *UserService) UpdateUserRole(id uint, newRole string, currentUserID uint
 		return err
 	}
 
-	return s.db.Transaction(func(tx *gorm.DB) error {
+	err = s.db.Transaction(func(tx *gorm.DB) error {
 		return tx.Model(&models.User{}).
 			Where("id = ?", id).
 			Updates(map[string]interface{}{
@@ -235,6 +237,10 @@ func (s *UserService) UpdateUserRole(id uint, newRole string, currentUserID uint
 				"token_version": gorm.Expr("token_version + 1"),
 			}).Error
 	})
+	if err == nil && s.OnAuthorizationChange != nil {
+		s.OnAuthorizationChange()
+	}
+	return err
 }
 
 // DeleteUser deletes a user (admin only). Cannot delete self.
@@ -242,5 +248,9 @@ func (s *UserService) DeleteUser(id uint, currentUserID uint) error {
 	if id == currentUserID {
 		return ErrCannotDeleteSelf
 	}
-	return s.db.Delete(&models.User{}, id).Error
+	err := s.db.Delete(&models.User{}, id).Error
+	if err == nil && s.OnAuthorizationChange != nil {
+		s.OnAuthorizationChange()
+	}
+	return err
 }

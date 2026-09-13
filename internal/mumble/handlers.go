@@ -1069,6 +1069,7 @@ func (s *Server) handleAuthenticate(msgType protocol.MessageType, payload []byte
 		}
 	}
 	u.CertHash = certHash
+	u.CertificateVerified = c.CertificateVerified()
 	stored, ok := s.users.Add(u)
 	if !ok {
 		return s.sendReject(c, messages.RejectServerFull, "Server full")

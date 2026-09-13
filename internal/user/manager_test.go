@@ -139,3 +139,37 @@ func TestRemoveReturnsCopy(t *testing.T) {
 		t.Error("second Remove must report not found")
 	}
 }
+
+// 回调中重新读取管理器验证锁已释放，且非授权字段不会引发递归刷新。
+func TestAuthorizationRevisionAndNotification(t *testing.T) {
+	m := NewManager(nil, 10)
+	u, _ := m.Add(mumble.User{Name: "first", UserID: 7})
+	calls := 0
+	m.AddAuthorizationListener(func(changed mumble.User, removed bool) {
+		calls++
+		live, ok := m.Snapshot(changed.SessionID)
+		if removed {
+			if ok {
+				t.Error("删除通知时会话仍存在")
+			}
+			return
+		}
+		if !ok || live.AuthorizationRevision != changed.AuthorizationRevision {
+			t.Error("通知不是最新状态")
+		}
+	})
+	m.UpdateUser(u.SessionID, func(u *mumble.User) { u.Suppress = true })
+	if calls != 0 {
+		t.Fatal("Suppress 不应触发授权通知")
+	}
+	m.SetChannel(u.SessionID, 2)
+	live, _ := m.UpdateIdentity(u.SessionID, func(u *mumble.User) { u.ExternalGroups = []string{"team"} })
+	if calls != 2 || live.AuthorizationRevision != u.AuthorizationRevision+2 {
+		t.Fatal("授权 revision 未增长")
+	}
+	m.Remove(u.SessionID)
+	next, _ := m.Add(mumble.User{Name: "second"})
+	if calls != 3 || next.SessionGeneration == u.SessionGeneration {
+		t.Fatal("会话代次或断线通知错误")
+	}
+}

@@ -25,5 +25,8 @@ const (
 	PermissionSelfRegister Permission = 0x80000
 	PermissionResetUser    Permission = 0x100000
 	PermissionCached       Permission = 0x8000000
-	PermissionAll          Permission = 0xF07FF
+	PermissionAll          Permission = PermissionWrite | PermissionTraverse | PermissionEnter |
+		PermissionSpeak | PermissionMuteDeafen | PermissionMove | PermissionMakeChannel |
+		PermissionLinkChannel | PermissionWhisper | PermissionTextMessage | PermissionMakeTempChannel |
+		PermissionListen | PermissionKick | PermissionBan | PermissionRegister | PermissionSelfRegister | PermissionResetUser
 )

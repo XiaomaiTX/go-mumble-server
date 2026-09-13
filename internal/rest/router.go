@@ -61,6 +61,12 @@ func RouterWithMumble(db *gorm.DB, cfg *config.Config, feFS fs.FS, userLister ha
 // RouterWithMumbleAndIdentity adds the provider-neutral callback endpoint.
 func RouterWithMumbleAndIdentity(db *gorm.DB, cfg *config.Config, feFS fs.FS, userLister handler.ConnectedUserLister, userActioner handler.ConnectedUserActioner, channelCrypto handler.ChannelCryptoLister, getChanMgr GetChannelManager, onACLChange OnACLChange, onBanChange OnBanChange, onChannelMutated handler.OnChannelMutated, onConfigChange handler.OnConfigChange, revalidate RevalidateIdentity) http.Handler {
 	userSvc := service.NewUserService(db, cfg)
+	if onACLChange != nil {
+		userSvc.OnAuthorizationChange = func() {
+			// 当前 runtime 固定为 server 1，与 Mumble 适配器保持一致。
+			onACLChange(1)
+		}
+	}
 	authHandler := handler.NewAuthHandler(userSvc, db, cfg)
 	userHandler := handler.NewUserHandler(userSvc)
 	serverHandler := handler.NewServerHandler(db, cfg, userLister, userActioner, channelCrypto, (func(serverID uint) *channel.Manager)(getChanMgr), onChannelMutated, onConfigChange)

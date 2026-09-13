@@ -20,11 +20,16 @@ type VoiceState struct {
 
 // User represents a connected Mumble user (client session).
 type User struct {
-	SessionID    uint32
-	UserID       uint32
-	ChannelID    uint32
-	Name         string
-	AccessTokens []string // from Authenticate message, for token groups
+	// SessionGeneration 和 AuthorizationRevision 由用户管理器维护，不接受客户端输入。
+	SessionGeneration     uint64
+	AuthorizationRevision uint64
+	// CertificateVerified 仅表示 TLS 验证产生了可信证书链。
+	CertificateVerified bool
+	SessionID           uint32
+	UserID              uint32
+	ChannelID           uint32
+	Name                string
+	AccessTokens        []string // from Authenticate message, for token groups
 	// ExternalGroups are authority-issued session claims. They are kept
 	// separate from client-supplied AccessTokens so authority claims cannot be forged.
 	ExternalGroups          []string

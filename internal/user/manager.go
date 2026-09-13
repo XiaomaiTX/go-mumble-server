@@ -1,6 +1,7 @@
 package user
 
 import (
+	"slices"
 	"sync"
 
 	"github.com/dchote/go-mumble-server/pkg/mumble"
@@ -18,12 +19,14 @@ type SpeakGate struct {
 
 // Manager tracks connected Mumble user sessions.
 type Manager struct {
-	mu        sync.RWMutex
-	bySession map[uint32]*mumble.User
-	byName    map[string]*mumble.User
-	pool      *sessionPool
-	db        *gorm.DB
-	maxUsers  int
+	mu                     sync.RWMutex
+	bySession              map[uint32]*mumble.User
+	byName                 map[string]*mumble.User
+	pool                   *sessionPool
+	db                     *gorm.DB
+	maxUsers               int
+	generation             uint64
+	authorizationListeners []func(mumble.User, bool)
 }
 
 // NewManager creates a UserManager.
@@ -55,7 +58,10 @@ func (m *Manager) Add(u mumble.User) (mumble.User, bool) {
 		return mumble.User{}, false
 	}
 	stored := cloneUser(&u)
+	m.generation++
 	stored.SessionID = sid
+	stored.SessionGeneration = m.generation
+	stored.AuthorizationRevision = 1
 	m.bySession[sid] = &stored
 	m.byName[stored.Name] = &stored
 	return cloneUser(&stored), true
@@ -64,11 +70,22 @@ func (m *Manager) Add(u mumble.User) (mumble.User, bool) {
 // Remove removes a user by session ID, returning a copy of the removed record.
 func (m *Manager) Remove(sessionID uint32) (mumble.User, bool) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	var changed *mumble.User
+	listeners := append([]func(mumble.User, bool){}, m.authorizationListeners...)
+	defer func() {
+		m.mu.Unlock()
+		if changed != nil {
+			for _, notify := range listeners {
+				notify(*changed, true)
+			}
+		}
+	}()
 	u := m.bySession[sessionID]
 	if u == nil {
 		return mumble.User{}, false
 	}
+	snapshot := cloneUser(u)
+	changed = &snapshot
 	delete(m.bySession, sessionID)
 	delete(m.byName, u.Name)
 	m.pool.Free(sessionID)
@@ -229,12 +246,29 @@ func (m *Manager) ChannelID(sessionID uint32) (uint32, bool) {
 // edits of the live record.
 func (m *Manager) UpdateUser(sessionID uint32, fn func(*mumble.User)) (mumble.User, bool) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	var changed *mumble.User
+	listeners := append([]func(mumble.User, bool){}, m.authorizationListeners...)
+	defer func() {
+		m.mu.Unlock()
+		if changed != nil {
+			for _, notify := range listeners {
+				notify(*changed, false)
+			}
+		}
+	}()
 	u := m.bySession[sessionID]
 	if u == nil {
 		return mumble.User{}, false
 	}
+	before := cloneUser(u)
 	fn(u)
+	u.SessionGeneration = before.SessionGeneration
+	u.AuthorizationRevision = before.AuthorizationRevision
+	if authorizationChanged(before, *u) {
+		u.AuthorizationRevision++
+		snapshot := cloneUser(u)
+		changed = &snapshot
+	}
 	return cloneUser(u), true
 }
 
@@ -242,7 +276,16 @@ func (m *Manager) UpdateUser(sessionID uint32, fn func(*mumble.User)) (mumble.Us
 // sync. It rejects a canonical rename that collides with another live session.
 func (m *Manager) UpdateIdentity(sessionID uint32, fn func(*mumble.User)) (mumble.User, bool) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	var changed *mumble.User
+	listeners := append([]func(mumble.User, bool){}, m.authorizationListeners...)
+	defer func() {
+		m.mu.Unlock()
+		if changed != nil {
+			for _, notify := range listeners {
+				notify(*changed, false)
+			}
+		}
+	}()
 	u := m.bySession[sessionID]
 	if u == nil {
 		return mumble.User{}, false
@@ -252,6 +295,13 @@ func (m *Manager) UpdateIdentity(sessionID uint32, fn func(*mumble.User)) (mumbl
 	fn(&candidate)
 	if other := m.byName[candidate.Name]; other != nil && other.SessionID != sessionID {
 		return mumble.User{}, false
+	}
+	candidate.SessionGeneration = u.SessionGeneration
+	candidate.AuthorizationRevision = u.AuthorizationRevision
+	if authorizationChanged(*u, candidate) {
+		candidate.AuthorizationRevision++
+		snapshot := cloneUser(&candidate)
+		changed = &snapshot
 	}
 	*u = cloneUser(&candidate)
 	if oldName != u.Name {
@@ -280,11 +330,21 @@ func cloneUser(u *mumble.User) mumble.User {
 
 // SetChannel updates a user's channel.
 func (m *Manager) SetChannel(sessionID uint32, channelID uint32) {
+	m.UpdateUser(sessionID, func(u *mumble.User) { u.ChannelID = channelID })
+}
+
+// AddAuthorizationListener 在授权状态改变或会话删除后通知，回调不持有用户锁。
+func (m *Manager) AddAuthorizationListener(notify func(mumble.User, bool)) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if u := m.bySession[sessionID]; u != nil {
-		u.ChannelID = channelID
-	}
+	m.authorizationListeners = append(m.authorizationListeners, notify)
+}
+
+func authorizationChanged(a, b mumble.User) bool {
+	return a.UserID != b.UserID || a.ChannelID != b.ChannelID || a.IsSuperUser != b.IsSuperUser ||
+		a.CertHash != b.CertHash || a.CertificateVerified != b.CertificateVerified ||
+		a.ExternalIdentity != b.ExternalIdentity || a.IdentityVersion != b.IdentityVersion || a.PolicyVersion != b.PolicyVersion ||
+		!slices.Equal(a.AccessTokens, b.AccessTokens) || !slices.Equal(a.ExternalGroups, b.ExternalGroups)
 }
 
 // LookupAPIUser looks up an API user by username, returning id, password hash, role, and found.

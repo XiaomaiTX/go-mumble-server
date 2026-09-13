@@ -14,10 +14,11 @@ const rootChannelID uint32 = 0
 
 // Manager maintains the channel tree state.
 type Manager struct {
-	mu       sync.RWMutex
-	db       *gorm.DB
-	serverID uint
-	tree     map[uint32]*channelNode
+	mu                     sync.RWMutex
+	db                     *gorm.DB
+	serverID               uint
+	tree                   map[uint32]*channelNode
+	authorizationListeners []func()
 }
 
 type channelNode struct {
@@ -40,6 +41,7 @@ func NewManager(db *gorm.DB, serverID uint) *Manager {
 // been modified outside this manager (e.g. by another process or REST when using
 // a fallback manager).
 func (m *Manager) Reload() {
+	defer m.notifyAuthorizationChange()
 	m.mu.Lock()
 	m.tree = make(map[uint32]*channelNode)
 	m.mu.Unlock()
@@ -257,6 +259,7 @@ func (m *Manager) GetChannelWithMeta(channelID uint32) (ch *mumble.Channel, inhe
 
 // Create creates a new channel. Returns the channel or nil on error.
 func (m *Manager) Create(parentID uint32, name string, description string, position int32, temporary bool, maxUsers uint32) *mumble.Channel {
+	defer m.notifyAuthorizationChange()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if _, ok := m.tree[parentID]; !ok {
@@ -314,6 +317,7 @@ type UpdateOpts struct {
 
 // Update updates channel metadata. Returns false if channel not found or update failed.
 func (m *Manager) Update(id uint32, opts UpdateOpts) bool {
+	defer m.notifyAuthorizationChange()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	n, ok := m.tree[id]
@@ -371,6 +375,7 @@ func (m *Manager) Update(id uint32, opts UpdateOpts) bool {
 
 // Remove removes a channel. Returns false if channel not found, is root, or has children.
 func (m *Manager) Remove(id uint32) bool {
+	defer m.notifyAuthorizationChange()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if id == 0 {
@@ -437,6 +442,7 @@ func (m *Manager) SubtreeIDs(id uint32) []uint32 {
 // CleanEmptyTempChannels removes temporary channels that have no users and no children.
 // hasUsers returns true if the channel has any users.
 func (m *Manager) CleanEmptyTempChannels(hasUsers func(channelID uint32) bool) {
+	defer m.notifyAuthorizationChange()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	removed := true
@@ -465,5 +471,20 @@ func (m *Manager) CleanEmptyTempChannels(hasUsers func(channelID uint32) bool) {
 			removed = true
 			break
 		}
+	}
+}
+
+// AddAuthorizationListener 注册频道变更通知。
+func (m *Manager) AddAuthorizationListener(notify func()) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.authorizationListeners = append(m.authorizationListeners, notify)
+}
+func (m *Manager) notifyAuthorizationChange() {
+	m.mu.RLock()
+	listeners := append([]func(){}, m.authorizationListeners...)
+	m.mu.RUnlock()
+	for _, notify := range listeners {
+		notify()
 	}
 }

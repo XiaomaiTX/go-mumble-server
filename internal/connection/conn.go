@@ -262,3 +262,9 @@ func (c *Conn) writeOne(req writeReq) {
 		protocol.WriteMessage(c, req.msgType, req.msg)
 	}
 }
+
+// CertificateVerified 只信任 TLS 已验证的证书链，不以证书存在代替验证。
+func (c *Conn) CertificateVerified() bool {
+	conn, ok := c.Conn.(*tls.Conn)
+	return ok && len(conn.ConnectionState().VerifiedChains) > 0
+}

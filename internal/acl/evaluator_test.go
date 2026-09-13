@@ -97,15 +97,15 @@ func TestEvaluator_NonInheritingChannelIgnoresAncestorACLs(t *testing.T) {
 	chans.Reload()
 
 	seedACL(t, e, db, chans.RootID(), mumble.PermissionMuteDeafen, true)
-	seedACL(t, e, db, private.ID, mumble.PermissionKick, true)
+	seedACL(t, e, db, private.ID, mumble.PermissionMove, true)
 
 	if e.Check(SubjectForUserID(7), private.ID, mumble.PermissionMuteDeafen) {
 		t.Error("non-inheriting channel picked up an ancestor's ACL")
 	}
-	if !e.Check(SubjectForUserID(7), private.ID, mumble.PermissionKick) {
+	if !e.Check(SubjectForUserID(7), private.ID, mumble.PermissionMove) {
 		t.Error("non-inheriting channel lost its own ACL")
 	}
-	if !e.Check(SubjectForUserID(7), below.ID, mumble.PermissionKick) {
+	if !e.Check(SubjectForUserID(7), below.ID, mumble.PermissionMove) {
 		t.Error("child of a non-inheriting channel lost the inherited ACL")
 	}
 	if e.Check(SubjectForUserID(7), below.ID, mumble.PermissionMuteDeafen) {
@@ -127,8 +127,8 @@ func TestEvaluator_BaselineSurvivesTheFirstACLRow(t *testing.T) {
 	if missing := before &^ after; missing != 0 {
 		t.Errorf("permissions %#x were lost when the first ACL row appeared", missing)
 	}
-	if !e.Check(SubjectForUserID(registeredUser), chans.RootID(), mumble.PermissionSelfRegister) {
-		t.Error("registered user lost SelfRegister")
+	if e.Check(SubjectForUserID(registeredUser), chans.RootID(), mumble.PermissionSelfRegister) {
+		t.Error("无 auth ACL 时不应按注册 ID 自动授予 SelfRegister")
 	}
 	if !e.Check(SubjectForUserID(registeredUser), chans.RootID(), mumble.PermissionSpeak) {
 		t.Error("registered user lost the Speak baseline")
@@ -172,16 +172,11 @@ func TestEvaluator_AnonymousSessionsResolveInAndOutIndependently(t *testing.T) {
 	}
 }
 
-// An unknown channel has no chain at all; everyone still gets the baseline rather
-// than an empty mask that would lock the server down.
-func TestEvaluator_UnknownChannelFallsBackToBaseline(t *testing.T) {
+// 未知频道无法授权，不能回退到普通参与权限。
+func TestEvaluator_UnknownChannelDenies(t *testing.T) {
 	e, _, _, _ := newTestEvaluator(t)
-
-	if !e.Check(Subject{}, 4242, mumble.PermissionSpeak) {
-		t.Error("baseline Speak missing for an unknown channel")
-	}
-	if e.Check(Subject{}, 4242, mumble.PermissionMuteDeafen) {
-		t.Error("unknown channel handed out an administrative permission")
+	if p := e.EffectivePermissions(Subject{}, 4242); p != 0 {
+		t.Fatalf("未知频道权限 = %#x", p)
 	}
 }
 
