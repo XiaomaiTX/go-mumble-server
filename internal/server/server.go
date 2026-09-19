@@ -117,6 +117,7 @@ func (s *Server) Start(ctx context.Context) error {
 		if serverID == 1 {
 			ms.ACLEvaluator().InvalidateCache()
 			ms.RefreshSuppressStates()
+			ms.RefreshEnterStates()
 		}
 	}
 	onBanChange := func(serverID uint) {

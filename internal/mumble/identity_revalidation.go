@@ -129,6 +129,7 @@ func (s *Server) revalidateSnapshots(ctx context.Context, sessions []externalSes
 	if changed {
 		s.invalidateACLCache()
 		s.RefreshSuppressStates()
+		s.RefreshEnterStates()
 	}
 	return nil
 }

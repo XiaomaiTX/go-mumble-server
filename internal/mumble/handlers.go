@@ -675,6 +675,55 @@ func (s *Server) RefreshSuppressStates() {
 	}
 }
 
+// RefreshEnterStates sends receiver-specific channel lock state to every active
+// client. ACL edits are rare, so a full refresh is preferred over attempting to
+// infer all descendants affected by inheritance, groups, or ApplySubs.
+func (s *Server) RefreshEnterStates() {
+	if s == nil || s.users == nil || s.chans == nil {
+		return
+	}
+	channels := s.chans.GetTree()
+	restricted := s.enterRestrictedChannels()
+	for _, u := range s.users.SnapshotAll() {
+		s.refreshEnterStatesFor(u, s.conn(u.SessionID), channels, restricted)
+	}
+}
+
+// RefreshEnterStatesFor refreshes lock state for one session. Channel moves can
+// change @in/@out/@sub membership for that user without changing any ACL row.
+func (s *Server) RefreshEnterStatesFor(sessionID uint32) {
+	if s == nil || s.users == nil || s.chans == nil {
+		return
+	}
+	u, ok := s.users.Snapshot(sessionID)
+	if !ok {
+		return
+	}
+	s.refreshEnterStatesFor(u, s.conn(sessionID), s.chans.GetTree(), s.enterRestrictedChannels())
+}
+
+func (s *Server) refreshEnterStatesFor(u mumble.User, c *connection.Conn, channels []*mumble.Channel, restricted map[uint32]bool) {
+	if c == nil || c.State() != connection.StateActive {
+		return
+	}
+	subject := acl.SubjectOf(u)
+	for _, ch := range channels {
+		_ = c.WriteMessage(protocol.MessageChannelState, s.channelToStateFor(ch, subject, restricted[ch.ID]))
+	}
+}
+
+func (s *Server) enterRestrictedChannels() map[uint32]bool {
+	if s == nil || s.acl == nil {
+		return map[uint32]bool{}
+	}
+	restricted, err := s.acl.EnterRestrictedChannels()
+	if err != nil {
+		slog.Warn("加载频道 Enter 限制失败", "error", err)
+		return map[uint32]bool{}
+	}
+	return restricted
+}
+
 // baselinePermissions is what this server answers with when it has no ACL
 // evaluator at all, so an evaluator-less server is neither wide open nor completely
 // locked down: ordinary participation is allowed, administration is not.
@@ -800,8 +849,14 @@ func (s *Server) SetVoiceDebug(enabled bool) {
 // BroadcastChannelState broadcasts a channel's state to all connected clients.
 // Used when channels are created/updated via REST so Mumble clients see the changes.
 func (s *Server) BroadcastChannelState(ch *mumble.Channel) {
-	if ch != nil {
-		s.Broadcast(0, protocol.MessageChannelState, channelToState(ch))
+	if ch == nil || s.users == nil {
+		return
+	}
+	restricted := s.enterRestrictedChannels()[ch.ID]
+	for _, u := range s.users.SnapshotAll() {
+		if c := s.conn(u.SessionID); c != nil && c.State() == connection.StateActive {
+			_ = c.WriteMessage(protocol.MessageChannelState, s.channelToStateFor(ch, acl.SubjectOf(u), restricted))
+		}
 	}
 }
 
@@ -1227,8 +1282,10 @@ func (s *Server) sendSync(c *connection.Conn, u mumble.User) {
 	// the sender when the client sends its first UDP packet (ping/voice) after CryptSetup.
 	s.RegisterConn(u.SessionID, c)
 	_ = c.WriteMessage(protocol.MessageCodecVersion, &messages.CodecVersion{Opus: true})
+	restricted := s.enterRestrictedChannels()
+	subject := acl.SubjectOf(u)
 	for _, ch := range s.chans.GetTree() {
-		cs := channelToState(ch)
+		cs := s.channelToStateFor(ch, subject, restricted[ch.ID])
 		_ = c.WriteMessage(protocol.MessageChannelState, cs)
 	}
 	// Listening state rides the roster snapshots so a connecting client can render
@@ -1302,6 +1359,15 @@ func channelToState(ch *mumble.Channel) *messages.ChannelState {
 		Temporary:   ch.IsTemporary,
 		Links:       ch.Links,
 	}
+}
+
+func (s *Server) channelToStateFor(ch *mumble.Channel, subject acl.Subject, restricted bool) *messages.ChannelState {
+	state := channelToState(ch)
+	state.IsEnterRestricted = restricted
+	state.HasEnterRestricted = true
+	state.CanEnter = s.aclCheck(subject, ch.ID, mumble.PermissionEnter)
+	state.HasCanEnter = true
+	return state
 }
 
 // userToState builds a join/roster snapshot of a user for broadcast, mirroring
@@ -1756,6 +1822,11 @@ func (s *Server) handleUserState(msgType protocol.MessageType, payload []byte, c
 	us.SetFields |= messages.UserStateSetSession | messages.UserStateSetActor
 
 	s.Broadcast(0, protocol.MessageUserState, &us)
+	if channelMoved {
+		// Preserve Murmur's PermissionQuery/UserState ordering, then refresh the
+		// moved user's recipient-specific lock state for @in/@out/@sub rules.
+		s.RefreshEnterStatesFor(targetSession)
+	}
 
 	if us.Has(messages.UserStateSetRecording) {
 		s.broadcastRecordingAnnouncement(updated.Name, updated.Recording)
@@ -1838,8 +1909,7 @@ func (s *Server) handleChannelState(msgType protocol.MessageType, payload []byte
 			_ = c.WriteMessage(protocol.MessagePermissionDenied, &messages.PermissionDenied{Type: messages.DenyPermission, Reason: "Cannot create channel"})
 			return nil
 		}
-		state := channelToState(ch)
-		s.Broadcast(0, protocol.MessageChannelState, state)
+		s.BroadcastChannelState(ch)
 		return nil
 	}
 	opts := channel.UpdateOpts{}
@@ -1918,7 +1988,7 @@ func (s *Server) handleChannelState(msgType protocol.MessageType, payload []byte
 	}
 	if hasMetadataChange && s.chans.Update(cs.ChannelID, opts) {
 		if updated, ok := s.chans.GetChannel(cs.ChannelID); ok {
-			s.Broadcast(0, protocol.MessageChannelState, channelToState(updated))
+			s.BroadcastChannelState(updated)
 		}
 	}
 	if hasLinkChange {
@@ -1933,7 +2003,7 @@ func (s *Server) handleChannelState(msgType protocol.MessageType, payload []byte
 		}
 		for _, id := range changed {
 			if linked, ok := s.chans.GetChannel(id); ok {
-				s.Broadcast(0, protocol.MessageChannelState, channelToState(linked))
+				s.BroadcastChannelState(linked)
 			}
 		}
 	}

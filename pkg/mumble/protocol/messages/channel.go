@@ -43,20 +43,22 @@ func (m *ChannelRemove) Unmarshal(data []byte) error {
 
 // ChannelState (type 7).
 type ChannelState struct {
-	ChannelID         uint32
-	Parent            uint32
-	HasParent         bool // if true, parent field is sent on wire; root omits parent
-	Name              string
-	Links             []uint32
-	Description       string
-	LinksAdd          []uint32
-	LinksRemove       []uint32
-	Temporary         bool
-	Position          int32
-	DescriptionHash   []byte
-	MaxUsers          uint32
-	IsEnterRestricted bool
-	CanEnter          bool
+	ChannelID          uint32
+	Parent             uint32
+	HasParent          bool // if true, parent field is sent on wire; root omits parent
+	Name               string
+	Links              []uint32
+	Description        string
+	LinksAdd           []uint32
+	LinksRemove        []uint32
+	Temporary          bool
+	Position           int32
+	DescriptionHash    []byte
+	MaxUsers           uint32
+	IsEnterRestricted  bool
+	HasEnterRestricted bool // proto2 presence: false must still be sendable after ACL removal
+	CanEnter           bool
+	HasCanEnter        bool // proto2 presence: can_enter is specific to the receiving user
 }
 
 func (m *ChannelState) Marshal() ([]byte, error) {
@@ -102,13 +104,21 @@ func (m *ChannelState) Marshal() ([]byte, error) {
 		b = wire.AppendTag(b, 11, wire.WireVarint)
 		b = wire.AppendVarint(b, uint64(m.MaxUsers))
 	}
-	if m.IsEnterRestricted {
+	if m.HasEnterRestricted || m.IsEnterRestricted {
 		b = wire.AppendTag(b, 12, wire.WireVarint)
-		b = wire.AppendVarint(b, 1)
+		if m.IsEnterRestricted {
+			b = wire.AppendVarint(b, 1)
+		} else {
+			b = wire.AppendVarint(b, 0)
+		}
 	}
-	if m.CanEnter {
+	if m.HasCanEnter || m.CanEnter {
 		b = wire.AppendTag(b, 13, wire.WireVarint)
-		b = wire.AppendVarint(b, 1)
+		if m.CanEnter {
+			b = wire.AppendVarint(b, 1)
+		} else {
+			b = wire.AppendVarint(b, 0)
+		}
 	}
 	return b, nil
 }
@@ -207,6 +217,7 @@ func (m *ChannelState) Unmarshal(data []byte) error {
 			}
 			b = b[n:]
 			m.IsEnterRestricted = v != 0
+			m.HasEnterRestricted = true
 		case 13:
 			v, n, err := wire.ReadVarint(b)
 			if err != nil {
@@ -214,6 +225,7 @@ func (m *ChannelState) Unmarshal(data []byte) error {
 			}
 			b = b[n:]
 			m.CanEnter = v != 0
+			m.HasCanEnter = true
 		default:
 			skip, err := wire.SkipField(b, wt)
 			if err != nil {

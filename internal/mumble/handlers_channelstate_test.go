@@ -1,10 +1,14 @@
 package mumble
 
 import (
-	"bytes"
+	"net"
 	"testing"
 
+	"github.com/dchote/go-mumble-server/internal/acl"
+	"github.com/dchote/go-mumble-server/internal/database/models"
 	"github.com/dchote/go-mumble-server/pkg/mumble"
+	"github.com/dchote/go-mumble-server/pkg/mumble/protocol"
+	"github.com/dchote/go-mumble-server/pkg/mumble/protocol/messages"
 	"github.com/dchote/go-mumble-server/pkg/mumble/protocol/wire"
 )
 
@@ -52,6 +56,105 @@ func TestChannelToState_ChildCarriesItsParent(t *testing.T) {
 	}
 }
 
+func TestChannelState_MarshalsExplicitFalseEnterFlags(t *testing.T) {
+	state := &messages.ChannelState{
+		ChannelID:          3,
+		HasEnterRestricted: true,
+		HasCanEnter:        true,
+	}
+
+	payload, err := state.Marshal()
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if !fieldPresentOnWire(t, payload, 12) {
+		t.Fatal("is_enter_restricted=false 未写入线路，客户端会保留旧锁状态")
+	}
+	if !fieldPresentOnWire(t, payload, 13) {
+		t.Fatal("can_enter=false 未写入线路，客户端无法显示红锁")
+	}
+
+	var decoded messages.ChannelState
+	if err := decoded.Unmarshal(payload); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if !decoded.HasEnterRestricted || decoded.IsEnterRestricted {
+		t.Fatalf("is_enter_restricted 解码结果错误: present=%v value=%v", decoded.HasEnterRestricted, decoded.IsEnterRestricted)
+	}
+	if !decoded.HasCanEnter || decoded.CanEnter {
+		t.Fatalf("can_enter 解码结果错误: present=%v value=%v", decoded.HasCanEnter, decoded.CanEnter)
+	}
+}
+
+func TestRefreshEnterStates_PersonalizesLockStateAndClearsIt(t *testing.T) {
+	srv := newACLTestServer(t)
+	child := srv.chans.Create(srv.chans.RootID(), "受限频道", "", 0, false, 0)
+	denyACL(t, srv, child.ID, mumble.PermissionEnter)
+
+	allowedID := uint32(7)
+	allowedACLID := int32(allowedID)
+	if err := acl.CreateACL(srv.db, &models.ChannelACL{
+		ServerID:  srv.chans.ServerID(),
+		ChannelID: uint(child.ID),
+		Priority:  2,
+		ApplyHere: true,
+		UserID:    &allowedACLID,
+		Grant:     uint32(mumble.PermissionEnter),
+	}); err != nil {
+		t.Fatalf("创建用户 Enter 授权: %v", err)
+	}
+	srv.acl.InvalidateCache()
+
+	allowed := &mumble.User{Name: "allowed", UserID: allowedID, ChannelID: srv.chans.RootID()}
+	_, allowedPeer := connectTestUser(t, srv, allowed)
+	denied := &mumble.User{Name: "denied", UserID: 8, ChannelID: srv.chans.RootID()}
+	_, deniedPeer := connectTestUser(t, srv, denied)
+
+	srv.RefreshEnterStates()
+	allowedState := readChannelStateFor(t, allowedPeer, child.ID)
+	deniedState := readChannelStateFor(t, deniedPeer, child.ID)
+	assertEnterState(t, allowedState, true, true)
+	assertEnterState(t, deniedState, true, false)
+
+	if err := srv.db.Where("server_id = ? AND channel_id = ?", srv.chans.ServerID(), child.ID).
+		Delete(&models.ChannelACL{}).Error; err != nil {
+		t.Fatalf("删除频道 ACL: %v", err)
+	}
+	srv.acl.InvalidateCache()
+	srv.RefreshEnterStates()
+	assertEnterState(t, readChannelStateFor(t, allowedPeer, child.ID), false, true)
+	assertEnterState(t, readChannelStateFor(t, deniedPeer, child.ID), false, true)
+}
+
+func readChannelStateFor(t *testing.T, conn net.Conn, channelID uint32) *messages.ChannelState {
+	t.Helper()
+	for i := 0; i < 10; i++ {
+		kind, payload := readMessage(t, conn)
+		if kind != protocol.MessageChannelState {
+			continue
+		}
+		var state messages.ChannelState
+		if err := state.Unmarshal(payload); err != nil {
+			t.Fatalf("Unmarshal ChannelState: %v", err)
+		}
+		if state.ChannelID == channelID {
+			return &state
+		}
+	}
+	t.Fatalf("未收到频道 %d 的 ChannelState", channelID)
+	return nil
+}
+
+func assertEnterState(t *testing.T, state *messages.ChannelState, restricted, canEnter bool) {
+	t.Helper()
+	if !state.HasEnterRestricted || state.IsEnterRestricted != restricted {
+		t.Errorf("is_enter_restricted: present=%v value=%v, want present=true value=%v", state.HasEnterRestricted, state.IsEnterRestricted, restricted)
+	}
+	if !state.HasCanEnter || state.CanEnter != canEnter {
+		t.Errorf("can_enter: present=%v value=%v, want present=true value=%v", state.HasCanEnter, state.CanEnter, canEnter)
+	}
+}
+
 // fieldPresentOnWire reports whether a protobuf field number appears in payload.
 func fieldPresentOnWire(t *testing.T, payload []byte, fieldNum int) bool {
 	t.Helper()
@@ -71,7 +174,5 @@ func fieldPresentOnWire(t *testing.T, payload []byte, fieldNum int) bool {
 		}
 		b = b[skip:]
 	}
-	// Silence unused import if bytes is only needed for clarity elsewhere.
-	_ = bytes.Equal
 	return false
 }

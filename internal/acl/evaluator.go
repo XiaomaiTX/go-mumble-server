@@ -85,6 +85,27 @@ func (e *Evaluator) CheckCurrent(subject Subject, channelID uint32, perm mumble.
 	return e.permissions(subject, channelID, false)&uint32(perm) == uint32(perm)
 }
 
+// EnterRestrictedChannels returns channels that contain a local ACL denying
+// Enter. This intentionally ignores selector matching and inheritance: Murmur's
+// is_enter_restricted flag describes whether the channel itself contains an
+// Enter denial, while can_enter carries the receiver-specific effective result.
+func (e *Evaluator) EnterRestrictedChannels() (map[uint32]bool, error) {
+	restricted := make(map[uint32]bool)
+	if e == nil || e.db == nil || e.chans == nil {
+		return restricted, nil
+	}
+	var rows []models.ChannelACL
+	if err := e.db.Select("channel_id", "deny").Where("server_id = ?", e.chans.ServerID()).Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	for _, row := range rows {
+		if row.Deny&uint32(mumble.PermissionEnter) != 0 {
+			restricted[uint32(row.ChannelID)] = true
+		}
+	}
+	return restricted, nil
+}
+
 func (e *Evaluator) permissions(subject Subject, channelID uint32, cached bool) uint32 {
 	// API 角色来自数据库：不缓存该扩展，直接撤权也不会留下旧权限。
 	cached = cached && !IsAPIUserID(subject.UserID)

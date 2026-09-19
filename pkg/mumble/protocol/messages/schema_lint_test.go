@@ -224,20 +224,22 @@ var schemaFieldMap = map[string]map[string]string{
 		"ChannelID": "channel_id",
 	},
 	"ChannelState": {
-		"ChannelID":         "channel_id",
-		"Parent":            "parent",
-		"HasParent":         "", // synthetic: presence flag for optional parent (root omits it)
-		"Name":              "name",
-		"Links":             "links",
-		"Description":       "description",
-		"LinksAdd":          "links_add",
-		"LinksRemove":       "links_remove",
-		"Temporary":         "temporary",
-		"Position":          "position",
-		"DescriptionHash":   "description_hash",
-		"MaxUsers":          "max_users",
-		"IsEnterRestricted": "is_enter_restricted",
-		"CanEnter":          "can_enter",
+		"ChannelID":          "channel_id",
+		"Parent":             "parent",
+		"HasParent":          "", // synthetic: presence flag for optional parent (root omits it)
+		"Name":               "name",
+		"Links":              "links",
+		"Description":        "description",
+		"LinksAdd":           "links_add",
+		"LinksRemove":        "links_remove",
+		"Temporary":          "temporary",
+		"Position":           "position",
+		"DescriptionHash":    "description_hash",
+		"MaxUsers":           "max_users",
+		"IsEnterRestricted":  "is_enter_restricted",
+		"HasEnterRestricted": "", // synthetic: proto2 presence flag for is_enter_restricted
+		"CanEnter":           "can_enter",
+		"HasCanEnter":        "", // synthetic: proto2 presence flag for can_enter
 	},
 	"UserRemove": {
 		"Session": "session",
@@ -597,7 +599,7 @@ var fixtures = map[string]Message{
 		ChannelID: 1, Parent: 2, HasParent: true, Name: "n", Links: []uint32{1},
 		Description: "d", LinksAdd: []uint32{2}, LinksRemove: []uint32{3},
 		Temporary: true, Position: 5, DescriptionHash: []byte{0xAB}, MaxUsers: 10,
-		IsEnterRestricted: true, CanEnter: true,
+		IsEnterRestricted: true, HasEnterRestricted: true, CanEnter: true, HasCanEnter: true,
 	},
 	"UserRemove": &UserRemove{Session: 1, Actor: 2, Reason: "r", Ban: true},
 	"UserState": &UserState{
