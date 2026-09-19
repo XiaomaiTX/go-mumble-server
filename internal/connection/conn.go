@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/dchote/go-mumble-server/pkg/mumble/audio"
 	"github.com/dchote/go-mumble-server/pkg/mumble/crypto"
 	"github.com/dchote/go-mumble-server/pkg/mumble/protocol"
 	"github.com/dchote/go-mumble-server/pkg/mumble/protocol/messages"
@@ -37,6 +38,7 @@ type Conn struct {
 	writing           bool
 	sessionID         uint32
 	clientCryptoModes uint32 // bitmask from Version.CryptoModes; 0 = legacy only (standard client)
+	audioWireMode     audio.WireMode
 	clientVersion     uint64 // packed major<<48|minor<<32|patch<<16 from Version; 0 = unknown, treated as "very old"
 	serverID          uint
 	userName          string
@@ -267,4 +269,18 @@ func (c *Conn) writeOne(req writeReq) {
 func (c *Conn) CertificateVerified() bool {
 	conn, ok := c.Conn.(*tls.Conn)
 	return ok && len(conn.ConnectionState().VerifiedChains) > 0
+}
+
+// NegotiateAudioWireMode 仅在认证前更新，UDP 与 TCP 共用已固定的协商结果。
+func (c *Conn) NegotiateAudioWireMode(serverVersion uint64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.state == StateAuthenticating {
+		c.audioWireMode = audio.NegotiateWireMode(c.clientVersion, serverVersion)
+	}
+}
+func (c *Conn) AudioWireMode() audio.WireMode {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.audioWireMode
 }

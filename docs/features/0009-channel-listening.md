@@ -39,13 +39,11 @@ targets (with the same group restriction as occupants).
 
 ## Client-side version gate
 
-The Mumble client only shows the channel context-menu "Listen" entry when the
-server reports version >= 1.4.0 (`MainWindow.cpp qmChannel_aboutToShow` checks
-`Global::get().sh->m_version`). That is why the control-channel `Version`
-message carries `VersionV1` = 1.4.0 (`mumble.ServerVersionV1`), and why the
-advertisement must stay below 1.5.0 until protobuf UDP voice (issue #22) is
-implemented — a 1.5.x handshake would switch 1.5 clients to the new UDP voice
-format this server cannot parse. `version_test.go` guards this window.
+The Mumble client shows the channel context-menu "Listen" entry when the server
+reports version >= 1.4.0. The control-channel `Version` message now carries
+`VersionV1/VersionV2` = 1.5.0 because the server implements the Protobuf UDP
+voice path. Clients below 1.5 continue to use Legacy audio; `version_test.go`
+guards the 1.5.0 declaration.
 
 ## Known deviations
 

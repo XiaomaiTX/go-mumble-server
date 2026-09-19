@@ -2,6 +2,7 @@ package mumble
 
 import (
 	"bytes"
+	ma "github.com/dchote/go-mumble-server/pkg/mumble/audio"
 	"net"
 	"testing"
 
@@ -250,12 +251,12 @@ func TestVoiceRoutesToListenersTargetZero(t *testing.T) {
 	drainBroadcast(t, aSide, bSide, cSide, dSide)
 
 	pkt := []byte{0x80, 0x01, 0xAA, 0xBB}
-	if err := s.router.Route(a.SessionID, 0, pkt); err != nil {
+	if err := s.router.Route(a.SessionID, ma.Frame{Codec: ma.CodecOpus, Target: 0, OpusData: pkt}); err != nil {
 		t.Fatalf("Route: %v", err)
 	}
 
 	kind, got := readMessage(t, bSide)
-	if kind != protocol.MessageUDPTunnel || !bytes.Equal(got, pkt) {
+	if kind != protocol.MessageUDPTunnel || !bytes.Equal(got, legacyDeliveryBytes(t, a.SessionID, ma.ContextListen, pkt)) {
 		t.Fatalf("listener got type=%d pkt=%v, want UDPTunnel %v", kind, got, pkt)
 	}
 	expectNoBroadcast(t, cSide)
@@ -279,11 +280,11 @@ func TestVoiceRoutesToLinkedChannelListeners(t *testing.T) {
 	readUserState(t, bSide)
 
 	pkt := []byte{0x80, 0x01, 0xCC}
-	if err := s.router.Route(a.SessionID, 0, pkt); err != nil {
+	if err := s.router.Route(a.SessionID, ma.Frame{Codec: ma.CodecOpus, Target: 0, OpusData: pkt}); err != nil {
 		t.Fatalf("Route: %v", err)
 	}
 	kind, got := readMessage(t, bSide)
-	if kind != protocol.MessageUDPTunnel || !bytes.Equal(got, pkt) {
+	if kind != protocol.MessageUDPTunnel || !bytes.Equal(got, legacyDeliveryBytes(t, a.SessionID, ma.ContextListen, pkt)) {
 		t.Fatalf("linked listener got type=%d pkt=%v, want UDPTunnel %v", kind, got, pkt)
 	}
 }
@@ -315,12 +316,12 @@ func TestVoiceRoutesLinkedChannelsCheckSpeakPerTarget(t *testing.T) {
 	_, allowedSide := connectTestUser(t, s, allowed)
 
 	pkt := []byte{0x80, 0x01, 0xDD}
-	if err := s.router.Route(sender.SessionID, 0, pkt); err != nil {
+	if err := s.router.Route(sender.SessionID, ma.Frame{Codec: ma.CodecOpus, Target: 0, OpusData: pkt}); err != nil {
 		t.Fatal(err)
 	}
 	expectNoBroadcast(t, deniedSide)
 	kind, got := readMessage(t, allowedSide)
-	if kind != protocol.MessageUDPTunnel || !bytes.Equal(got, pkt) {
+	if kind != protocol.MessageUDPTunnel || !bytes.Equal(got, legacyDeliveryBytes(t, sender.SessionID, ma.ContextNormal, pkt)) {
 		t.Fatalf("allowed target got type=%d packet=%v, want UDPTunnel %v", kind, got, pkt)
 	}
 }
@@ -368,7 +369,7 @@ func TestUnregisterConnDropsListeners(t *testing.T) {
 	if got := s.listeners.SessionIDsIn(ch.ID); len(got) != 0 {
 		t.Fatalf("SessionIDsIn after unregister = %v, want empty", got)
 	}
-	if err := s.router.Route(a.SessionID, 0, []byte{0x80, 0x01}); err != nil {
+	if err := s.router.Route(a.SessionID, ma.Frame{Codec: ma.CodecOpus, Target: 0, OpusData: []byte{0x80, 0x01}}); err != nil {
 		t.Fatalf("Route: %v", err)
 	}
 	expectNoBroadcast(t, bSide)

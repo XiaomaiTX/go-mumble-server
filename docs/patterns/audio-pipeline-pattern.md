@@ -1,150 +1,51 @@
-# Audio Pipeline Pattern
+# 音频处理流水线
 
-> **Status:** Implemented
+状态：双格式实现已接入，默认宣告 1.5.0；真实客户端互操作按验收清单执行。
 
-## Overview
+## 数据流
 
-The audio pipeline is the performance-critical path in a Mumble server. Audio packets arrive via UDP (or TCP tunnel), are decrypted, routed to recipients based on voice targets and channel topology, and forwarded without re-encoding. The server never decodes audio — it operates on opaque codec frames. Two protocol requirements are critical: (1) the server must echo UDP pings so clients can establish UDP connectivity; (2) the server must insert the sender's session ID into packets before forwarding, since client→server packets omit it but server→client packets require it.
-
-## Audio Packet Flow
-
-```
-  Client A (sender)
-       │
-       │  UDP (AEAD encrypted: OCB2 legacy / GCM secure)
-       │  ─── or ───
-       │  TCP tunnel (UDPTunnel, type 1)
-       ▼
-┌──────────────┐
-│   Receive    │  Decrypt (UDP) or extract (TCP tunnel)
-└──────┬───────┘
-       │
-       ▼
-┌──────────────┐
-│ Packet Type? │  Codec type from header (bits 7-5)
-└──────┬───────┘
-       │
-       ├── Codec 1 (Ping) ──► Echo back to sender (UDP only), unless channel
-       │                      has mixed crypto modes (then suppress to force TCP)
-       │
-       ▼
-┌──────────────┐
-│  Parse Header│  Extract: codec, target (session from TCP/decrypt)
-└──────┬───────┘
-       │
-       ▼
-┌──────────────┐
-│ Rewrite Pkt  │  Insert sender session ID (client→server has none;
-│              │  server→client must include it)
-└──────┬───────┘
-       │
-       ▼
-┌──────────────┐
-│ Route / Fan  │  Determine recipients from voice target
-│    Out       │  + channel links + listeners
-└──────┬───────┘
-       │
-       ▼ (for each recipient)
-┌──────────────┐
-│   Forward    │  Re-encrypt for recipient (UDP if addr known and channel
-│              │  not mixed-mode); else wrap in UDPTunnel (TCP fallback)
-└──────────────┘
-       │
-       ▼
-  Client B, C, ... (recipients)
+```text
+UDP 解密 / TCP UDPTunnel
+    ↓
+认证连接的 WireMode（双方版本决定，认证后固定）
+    ↓
+DecodeClientPacket → Frame（自有 Opus 缓冲区）
+    ↓
+认证 Session 覆盖身份 → 频道、ACL、VoiceTarget、Listener 路由
+    ↓
+Delivery（context、音量）→ 接收者 plugin context 位置过滤
+    ↓
+按 WireMode × Context × VolumeAdjustment × HasPosition 缓存编码
+    ↓
+接收者 CryptState 加密并发 UDP / 相同明文通过 TCP 回退
 ```
 
-## Packet Format (Legacy Binary)
+Frame 是发送者的音频事实，Delivery 是服务端生成的接收语义。路由器不接收预编码音频；旧的插入 Session 重写函数已经移除。服务器只重新封装协议，不解码或修改 Opus 内容。
 
-The original audio packet format (used inside `UDPTunnel` and legacy UDP):
+## 路由规则
 
-```
-Byte 0:       ┌─────────┬────────┐
-              │ Codec   │ Target │
-              │ (3 bit) │ (5 bit)│
-              └─────────┴────────┘
-Varint:       Sender Session (server→client only)
-Varint:       Sequence Number
-Varint:       Payload length (bit 13 = terminator flag)
-Bytes:        Opus/CELT frame data
-Optional:     3× float32 positional audio (X, Y, Z)
-```
+普通当前/链接频道使用 NORMAL；显式用户 VoiceTarget 使用 WHISPER；频道 VoiceTarget 使用 SHOUT；监听者使用 LISTEN；服务器回环使用 NORMAL。逐频道 Speak 和 Whisper ACL、发送者静音和接收者 deaf 检查保留。VoiceTarget 的显式用户绑定连接对象，防止 session 复用将耳语泄漏给新用户。
 
-Codec IDs:
-- `0` — CELT Alpha
-- `1` — Ping (UDP connectivity test; server echoes back)
-- `2` — Speex (deprecated)
-- `3` — CELT Beta
-- `4` — Opus (preferred)
+多条路径命中同一人时先去重，context 取最小值、音量 factor 取最大值，两者独立合并。仅在双方 plugin context 相等时保留位置数据。
 
-## Packet Format (Modern UDP — since protocol 1.5)
+## 编码和传输
 
-Modern clients may use wire-encoded UDP packets:
+每次路由创建独立 EncodingCache，不跨音频包缓存；同组接收者复用一次编码结果，加密仍逐连接执行。缓存键包括模式、上下文、音量的 float32 位模式和位置资格。缓存不会共享密钥、nonce 或密文。
 
-```
-message Audio {
-    uint32 target = 1;           // voice target (0 = normal, 1-30 = whisper, 31 = loopback)
-    uint32 context = 2;          // 0 = normal, 1 = shout
-    uint32 sender_session = 3;   // set by server
-    uint64 frame_number = 4;
-    bytes  opus_data = 5;
-    float  positional_data = 6;  // repeated, 3 floats
-    float  volume_adjustment = 7;
-    bool   is_terminator = 8;
-}
-```
+Legacy 与 Protobuf 双向转换保留 Opus、帧号、位置与终止标记。Protobuf 前缀是 0x00，target/context 是 oneof，位置使用 packed fixed32，`is_terminator` 是字段 16。详见[语音数据](../protocol/voice-data.md)。
 
-## Voice Targets
+UDP 地址已建立时优先 UDP；没有地址、加密失败或频道处于 mixed-crypto 时，使用同一接收者格式通过 UDPTunnel 发送。UDP 连接探测根据 wire mode 解析；服务器列表探测无已认证连接，继续支持双格式。
 
-| Target | Meaning |
-|--------|---------|
-| 0 | Normal — send to current channel + linked channels |
-| 1–30 | Whisper — send to preconfigured `VoiceTarget` |
-| 31 | Server loopback — echo back to sender |
+## 验证与观测
 
-Whisper targets are configured per-client via `VoiceTarget` messages and can specify:
-- Specific user sessions
-- A channel (with options: links, children, group filter)
+自动测试覆盖编解码固定向量、oneof、unknown field、畸形输入、浮点位模式、四种新旧组合、UDP/TCP 入口和出口、身份覆盖、NAT 重绑定、mixed-crypto 回退、位置过滤和 Listener 音量。路由语义单元测试直接断言 Delivery。
 
-## Routing Algorithm
+`voice_debug` 以低频记录解析模式、传输方式、解析失败和普通路由编码组数；发送日志保留 UDP/TCP 选择，不输出音频原始字节。性能基准区分单次 Protobuf 编码和 100 个同组接收者的缓存命中路径。
 
-For a voice packet from user A with target T:
+正式启用 1.5 之前仍需真实客户端确认停止说话、重连、丢包/乱序、位置音频以及新旧客户端互通，不能用单元测试代替互操作证据。
 
-1. **Target 31 (loopback):** Return packet to sender A.
-2. **Target 0 (normal):**
-   - Collect all users in A's channel.
-   - Collect all users in channels linked to A's channel.
-   - Collect all listeners on A's channel.
-   - Remove A from the recipient set.
-   - Filter by sender `Speak` permission; exclude recipients who are deaf or self-deaf (no `Listen` check on same-channel recipients — Murmur only checks `Listen` when adding cross-channel listeners).
-3. **Target 1–30 (whisper):**
-   - Look up A's `VoiceTarget[T]`.
-   - Resolve target sessions, channels (optionally with links/children/group).
-   - Filter by permission and state.
+## 官方源码对照
 
-## Receiver Grouping
-
-Recipients are grouped by transport and protocol version. Each recipient's `CryptState` determines the encryption (lite/legacy/secure); the server encrypts per recipient with the appropriate overhead (0, 4, or 28 bytes).
-
-## Performance Considerations
-
-- **Zero-copy forwarding** — Avoid decoding/re-encoding audio. Forward opaque frames.
-- **Goroutine for UDP** — A dedicated goroutine reads UDP packets and handles audio routing, minimizing latency.
-- **Minimal locking** — Audio routing needs channel links and user lists, which are read-locked (RWMutex) and rarely mutated during steady-state operation.
-- **Bandwidth enforcement** — Per-user bandwidth tracking via a leaky bucket. Excessive senders are suppressed.
-- **Batch sends** — Where possible, batch UDP `sendto` calls for multiple recipients.
-
-## Codec Negotiation
-
-On connect and when the user population changes:
-
-1. Server collects codec support from all connected clients.
-2. Server selects the codec supported by the most clients (Opus preferred).
-3. Server broadcasts `CodecVersion` if the preferred codec changes.
-
-## Reference
-
-- Murmur audio routing: `Server::processMsg()` in `research/mumble/src/murmur/Server.cpp`
-- Murmur receiver buffer: `AudioReceiverBuffer` in `research/mumble/src/murmur/AudioReceiverBuffer.h`
-- gumble audio handling: `handleUDPTunnel()` in `research/gumble/gumble/handlers.go`
-- gumble varint: `research/gumble/gumble/varint/`
+- [MumbleProtocol.cpp](https://github.com/mumble-voip/mumble/blob/v1.5.915/src/MumbleProtocol.cpp)
+- [AudioReceiverBuffer.cpp](https://github.com/mumble-voip/mumble/blob/v1.5.915/src/murmur/AudioReceiverBuffer.cpp)
+- [MumbleUDP.proto](https://github.com/mumble-voip/mumble/blob/v1.5.915/src/MumbleUDP.proto)

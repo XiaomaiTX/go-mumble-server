@@ -277,3 +277,13 @@ func (s *Server) applyListening(c *connection.Conn, target mumble.User, add, rem
 	_ = c.WriteMessage(protocol.MessageUserState, &full)
 	s.Broadcast(c.SessionID(), protocol.MessageUserState, &base)
 }
+
+// Volume 返回监听关系的音量 factor；未设置时为单位增益。
+func (m *listenerManager) Volume(session, channel uint32) float32 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if v, ok := m.volumes[session][channel]; ok {
+		return v
+	}
+	return 1
+}

@@ -1,6 +1,7 @@
 package mumble
 
 import (
+	ma "github.com/dchote/go-mumble-server/pkg/mumble/audio"
 	"net"
 
 	"github.com/dchote/go-mumble-server/internal/acl"
@@ -18,9 +19,10 @@ type voiceTargetSpec struct {
 }
 
 type voiceRecipient struct {
-	session uint32
-	conn    *connection.Conn
-	addr    net.Addr
+	session  uint32
+	conn     *connection.Conn
+	addr     net.Addr
+	delivery ma.Delivery
 }
 
 func (s *Server) storeVoiceTarget(c *connection.Conn, vt messages.VoiceTarget) {
@@ -79,7 +81,7 @@ func (s *Server) resolveVoiceTarget(sessionID uint32, targetID uint8) []voiceRec
 		return nil
 	}
 	var recipients []voiceRecipient
-	seen := make(map[uint32]bool)
+	seen := make(map[uint32]int)
 	permitted := make(map[uint32]bool)
 	checked := make(map[uint32]bool)
 	canWhisper := func(cid uint32) bool {
@@ -93,25 +95,30 @@ func (s *Server) resolveVoiceTarget(sessionID uint32, targetID uint8) []voiceRec
 		}
 		return permitted[cid]
 	}
-	add := func(u mumble.User) {
-		if u.SessionID == sessionID || seen[u.SessionID] || u.Deaf || u.SelfDeaf {
+	add := func(u mumble.User, context ma.Context, volume float32) {
+		if u.SessionID == sessionID || u.Deaf || u.SelfDeaf {
 			return
 		}
 		c := s.conns[u.SessionID]
 		if c == nil || c.State() != connection.StateActive {
 			return
 		}
-		seen[u.SessionID] = true
+		d := ma.Delivery{Context: context, VolumeAdjustment: volume}
+		if index, ok := seen[u.SessionID]; ok {
+			recipients[index].delivery = ma.MergeDelivery(recipients[index].delivery, d)
+			return
+		}
+		seen[u.SessionID] = len(recipients)
 		addr, _ := s.addrBySession.Load(u.SessionID)
 		a, _ := addr.(net.Addr)
-		recipients = append(recipients, voiceRecipient{u.SessionID, c, a})
+		recipients = append(recipients, voiceRecipient{session: u.SessionID, conn: c, addr: a, delivery: d})
 	}
 	for sid, expected := range spec.sessions {
 		if s.conns[sid] != expected {
 			continue
 		}
 		if u, ok := s.users.Snapshot(sid); ok && canWhisper(u.ChannelID) {
-			add(u)
+			add(u, ma.ContextWhisper, 1)
 		}
 	}
 	for _, target := range spec.channels {
@@ -144,14 +151,14 @@ func (s *Server) resolveVoiceTarget(sessionID uint32, targetID uint8) []voiceRec
 				if !groupAllows(u) {
 					continue
 				}
-				add(u)
+				add(u, ma.ContextShout, 1)
 			}
 			for _, sid := range s.listeners.SessionIDsIn(cid) {
 				u, ok := s.users.Snapshot(sid)
 				if !ok || !groupAllows(u) {
 					continue
 				}
-				add(u)
+				add(u, ma.ContextListen, s.listeners.Volume(sid, cid))
 			}
 		}
 	}
@@ -166,13 +173,15 @@ func (s *Server) getVoiceTargetRecipients(sessionID uint32, targetID uint8) []ui
 	return ids
 }
 
-func (s *Server) routeVoiceTarget(sessionID uint32, targetID uint8, packet []byte) error {
+func (s *Server) routeVoiceTarget(sessionID uint32, targetID uint8, frame ma.Frame, cache *ma.EncodingCache) error {
 	for _, r := range s.resolveVoiceTarget(sessionID, targetID) {
 		var addr interface{}
 		if r.addr != nil {
 			addr = r.addr
 		}
-		_ = s.sendAudioTo(r.session, r.conn, addr, packet)
+		d := r.delivery
+		d.Frame = frame
+		_ = s.sendDeliveryTo(r.session, r.conn, addr, d, cache)
 	}
 	return nil
 }

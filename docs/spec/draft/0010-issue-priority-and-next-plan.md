@@ -19,7 +19,7 @@ GitHub 当前有 26 个开放 Issue，另有 [#27](https://github.com/XiaomaiTX/
 1. ACL、Group、linked-channel 音频权限、BanList 查询和 Tree TextMessage 仍然属于公开生产前的安全门槛。
 2. VoiceTarget session 复用问题、QueryUsers 的 session-ID 问题、外部身份接口缺失问题已经被近期提交部分或主要解决，原 Issue 标题已过期。
 3. Channel Listener 已基本实现，但仍存在注册用户持久化和现代 UDP 音量字段等收口工作。
-4. 当前控制连接只宣告 Mumble `1.4.0`，这是为了避免客户端协商尚未实现的 Protobuf UDP；不能在实现 #22 之前单独把协议版本提高到 `1.5.x`。
+4. 当前控制连接已宣告 Mumble `1.5.0`，因为 Protobuf UDP 已实现；旧客户端仍按自身版本使用 Legacy。
 5. 如果项目定位是 EVE 的受控语音服务器，Legacy UDP 和原生管理协议可以后置；如果定位是官方 Mumble 1.5.x 的替代服务器，则 #22/#23 必须升级为发布阻断项。
 
 ## 二、重新排序后的 Issue 矩阵
@@ -100,7 +100,7 @@ ACL/Group 基础语义
 - 将 [#17](https://github.com/XiaomaiTX/go-mumble-server/issues/17) 标记为核心问题已由 identity authority 解决；如需权限门控，另开 follow-up。
 - 将 [#19](https://github.com/XiaomaiTX/go-mumble-server/issues/19) 改写为 Listener 持久化和现代 UDP 音量收口。
 - 将 [#25](https://github.com/XiaomaiTX/go-mumble-server/issues/25) 改写为外部 authority 与 Murmur ServerAuthenticator 的剩余行为差异。
-- 更新 [#23](https://github.com/XiaomaiTX/go-mumble-server/issues/23)，明确 `97eb8ce` 已宣告 control-channel `VersionV1=1.4.0`，当前仍不能宣告 `1.5.x`。
+- 更新 [#23](https://github.com/XiaomaiTX/go-mumble-server/issues/23)，记录 control-channel `VersionV1/VersionV2=1.5.0` 已实现，等待真实客户端证据后关闭。
 - 保持 [#27](https://github.com/XiaomaiTX/go-mumble-server/issues/27) 的 completed 状态。
 
 ### 阶段 1：安全基线
@@ -146,7 +146,7 @@ ACL/Group 基础语义
 5. 通过互操作测试后，再调整 #23 的 VersionV1/VersionV2 和能力宣告。
 6. 最后补齐 Listener 的持久化和现代 UDP 音量语义。
 
-在本阶段完成前，`ServerVersionV1` 应保持在 `1.4.x` 范围；不得通过单独修改版本字段制造未实现的 1.5 能力。
+本阶段代码已完成，`ServerVersionV1/VersionV2` 现在宣告 `1.5.0`；后续只需补充真实客户端互操作证据。
 
 ### 阶段 4：原生管理协议和身份模型
 

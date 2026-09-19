@@ -1,6 +1,6 @@
 # Technical Overview
 
-> **Status:** Functionally complete (beta). Protocol library and server implement the full Mumble feature set; REST API, web UI, and persistence are production-ready. Ready for v0.1 release.
+> **Status:** Beta. Core protocol and server implementation is complete; client compatibility acceptance is ongoing.
 
 go-mumble-server is a native Go implementation of the Mumble voice chat server, built on a reusable protocol library. This document describes the architecture, subsystems, and design decisions.
 
@@ -9,8 +9,8 @@ go-mumble-server is a native Go implementation of the Mumble voice chat server, 
 | Component | Technology |
 |-----------|-----------|
 | Language | Go 1.25+ |
-| Protocol serialization | Native Go structs with hand-written wire encoding (no protobuf) |
-| Audio codec | Opus (primary), CELT (compatibility) |
+| Protocol serialization | Hand-written wire encoding for control messages and MumbleUDP Audio (no protobuf runtime) |
+| Audio codec | Opus in Legacy and Protobuf packet formats |
 | UDP encryption | OCB2-AES128 (legacy), AES-256-GCM (secure), or cleartext (lite); mixed-mode channels force TCP relay |
 | TLS | Go standard library `crypto/tls` |
 | Database | SQLite (via CGo or pure-Go driver) |
@@ -142,7 +142,7 @@ go-mumble-server/
 │   └── vite.config.js
 ├── pkg/
 │   └── mumble/                  # ── Public Protocol Library ──
-│       ├── protocol/messages/   # Native Go message structs (no protobuf)
+│       ├── protocol/messages/   # Native Go control-message structs
 │       ├── protocol/            # Packet framing, message type IDs, handler table, wire encoding
 │       ├── protocol/wire/       # Hand-written Mumble-compatible wire encoder
 │       ├── crypto/              # CryptState: lite (cleartext), OCB2-AES128 (legacy), AES-256-GCM (secure)
@@ -233,7 +233,7 @@ The audio subsystem handles:
 - **Forwarding** — Sends audio to recipients via UDP (if the recipient has sent at least one UDP packet and their channel is not in mixed crypto mode) or TCP tunnel (fallback via `UDPTunnel` message).
 - **Mixed-mode enforcement** — The server tracks the active crypto modes per channel. When a channel has clients using different modes, all audio in that channel is forced through TCP tunnel to ensure correct encryption handling.
 
-Audio is **not decoded on the server** — packets are forwarded as opaque Opus/CELT frames. The server only inspects the header to determine routing.
+The server does not decode Opus content. It parses each packet into a Frame, routes it as a Delivery, and encodes it for each recipient's wire mode.
 
 Voice targets:
 - `0` — Normal talk (current channel + linked channels)
@@ -419,12 +419,13 @@ On first start, the TOML/env/flag values seed both tables. Subsequent changes ar
 
 - [Product Overview](product-overview.md) — Project vision and feature summary
 - **Technical Overview** — This document
-- [Protocol Encoding](architecture/protocol-encoding.md) — Native Go messages, no protobuf (contributors: do not add protobuf)
+- [Protocol Encoding](architecture/protocol-encoding.md) — Hand-written encoding for control messages and Audio wire (no protobuf runtime)
 
 ### Protocol
 
 - [Control Messages](protocol/control-messages.md) — TCP message catalog (types 0–26)
 - [Voice Data](protocol/voice-data.md) — UDP audio packet format and routing
+- [MumbleUDP Audio](features/0010-mumbleudp-audio.md) — Legacy and Mumble 1.5 Protobuf Audio support
 - [Security Modes](protocol/security-modes.md) — Per-client negotiated crypto tiers and mixed-mode enforcement
 - [Encryption](protocol/encryption.md) — TLS, AEAD ciphers, password hashing
 - [Permissions](protocol/permissions.md) — Permission bitmask definitions
@@ -456,7 +457,7 @@ On first start, the TOML/env/flag values seed both tables. Subsequent changes ar
 | TOML bootstrap + SQLite config | TOML for pre-DB settings; SQLite for runtime config editable via API/UI |
 | `internal/` for server logic | Enforces encapsulation; public API only via `pkg/mumble/` and REST |
 | Core types in library | `Channel`, `User`, `Permission` live in `pkg/`; ACL/ban/voice-target/text/version payloads live in `pkg/mumble/protocol/messages` |
-| **No Google protobuf** | Protocol uses native Go structs and hand-written wire encoding. Do not add `google.golang.org/protobuf` or protoc-generated code. |
+| **No protobuf runtime** | Control messages and MumbleUDP Audio use native Go structures and hand-written wire encoding; do not add `google.golang.org/protobuf` or protoc-generated code. |
 | Vue 3 + Vuetify frontend | Material Design UI with rich component library; Vuetify provides accessible, responsive components out of the box |
 | Embedded frontend via `//go:embed` | Single binary deployment; no separate web server needed; same binary serves both API and UI |
 | Vite with single-bundle build | `importMode: 'sync'` produces a single JS bundle, avoiding chunk 404 issues when served by the Go SPA handler |
@@ -467,7 +468,7 @@ On first start, the TOML/env/flag values seed both tables. Subsequent changes ar
 | Resource | Path / URL |
 |----------|-----------|
 | Mumble (Murmur) server | `research/mumble/src/murmur/` |
-| Mumble protocol reference | `research/mumble/src/Mumble.proto`, `research/mumble/src/MumbleUDP.proto` (reference only; we use native Go, not protobuf) |
+| Mumble protocol reference | `pkg/mumble/audio/testdata/MumbleUDP.proto` and the official `Mumble.proto` (field references only; Audio uses hand-written wire encoding) |
 | Mumble server config reference | `research/mumble/auxiliary_files/mumble-server.ini` |
 | gumble Go client library | `research/gumble/` |
 | Mumble protocol documentation | `research/mumble/docs/dev/network-protocol/` |

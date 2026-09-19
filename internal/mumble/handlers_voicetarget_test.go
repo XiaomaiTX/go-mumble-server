@@ -8,6 +8,7 @@ import (
 	"github.com/dchote/go-mumble-server/internal/connection"
 	"github.com/dchote/go-mumble-server/internal/database/models"
 	"github.com/dchote/go-mumble-server/pkg/mumble"
+	ma "github.com/dchote/go-mumble-server/pkg/mumble/audio"
 	"github.com/dchote/go-mumble-server/pkg/mumble/protocol"
 	"github.com/dchote/go-mumble-server/pkg/mumble/protocol/messages"
 	"sync"
@@ -232,7 +233,7 @@ func TestVoiceTargetConcurrentSessionReuse(t *testing.T) {
 			if got := s.getVoiceTargetRecipients(a.SessionID, 1); len(got) != 0 {
 				t.Errorf("旧目标泄漏到 %v", got)
 			}
-			_ = s.router.Route(a.SessionID, 1, []byte{1})
+			_ = s.router.Route(a.SessionID, ma.Frame{Codec: ma.CodecOpus, Target: 1, OpusData: []byte{1}})
 		}
 	}()
 	go func() {
@@ -258,11 +259,11 @@ func TestVoiceTargetSenderVoiceGates(t *testing.T) {
 	_, bc := connectTestUser(t, s, b)
 	setVoiceTarget(t, s, ac, messages.VoiceTargetTarget{Session: []uint32{b.SessionID}})
 	packet := []byte{1, 2, 3}
-	if err := s.router.Route(a.SessionID, 1, packet); err != nil {
+	if err := s.router.Route(a.SessionID, ma.Frame{Codec: ma.CodecOpus, Target: 1, OpusData: packet}); err != nil {
 		t.Fatal(err)
 	}
 	kind, got := readMessage(t, bc)
-	if kind != protocol.MessageUDPTunnel || !bytes.Equal(got, packet) {
+	if kind != protocol.MessageUDPTunnel || !bytes.Equal(got, legacyDeliveryBytes(t, a.SessionID, ma.ContextWhisper, packet)) {
 		t.Fatal("私聊路由未正常发送")
 	}
 	for _, state := range []mumble.VoiceState{{Mute: true}, {SelfMute: true}, {Suppress: true}} {
@@ -295,4 +296,13 @@ func TestVoiceTargetSessionReuseBeforeCleanup(t *testing.T) {
 		t.Fatal("未复用发送者 session")
 	}
 	assertVoiceRecipients(t, s, d.SessionID)
+}
+
+func legacyDeliveryBytes(t *testing.T, sender uint32, context ma.Context, payload []byte) []byte {
+	t.Helper()
+	b, err := ma.EncodeServerPacket(ma.WireLegacy, ma.Delivery{Frame: ma.Frame{Codec: ma.CodecOpus, SenderSession: sender, OpusData: payload}, Context: context})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
 }

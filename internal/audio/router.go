@@ -1,43 +1,34 @@
 package audio
 
 import (
+	ma "github.com/dchote/go-mumble-server/pkg/mumble/audio"
 	"log/slog"
 	"sync"
 	"sync/atomic"
 )
 
-// RecipientSender sends an audio packet to a recipient.
 type RecipientSender interface {
-	SendAudio(sessionID uint32, packet []byte) error
+	SendAudio(sessionID uint32, delivery ma.Delivery, cache *ma.EncodingCache) error
 }
-
-// RouterConfig configures the audio router.
 type RouterConfig struct {
 	Sender               RecipientSender
-	GetChan              func(sessionID uint32) uint32
-	GetUsersInChan       func(channelID uint32) []uint32
-	GetVoiceTarget       func(sessionID uint32, targetID uint8) []uint32
-	RouteVoiceTarget     func(sessionID uint32, targetID uint8, packet []byte) error
-	GetLinkedChans       func(channelID uint32) []uint32
-	GetListenersInChan   func(channelID uint32) []uint32
-	FilterRecipient      func(senderSessionID, recipientSessionID uint32) bool
-	CanSenderSpeak       func(senderSessionID uint32) bool
-	CanSenderSpeakInChan func(senderSessionID, channelID uint32) bool
+	GetChan              func(uint32) uint32
+	GetUsersInChan       func(uint32) []uint32
+	RouteVoiceTarget     func(uint32, uint8, ma.Frame, *ma.EncodingCache) error
+	GetLinkedChans       func(uint32) []uint32
+	GetListenersInChan   func(uint32) []uint32
+	GetListenerVolume    func(uint32, uint32) float32
+	FilterRecipient      func(uint32, uint32) bool
+	CanSenderSpeak       func(uint32) bool
+	CanSenderSpeakInChan func(uint32, uint32) bool
 	VoiceDebug           bool
 }
-
-// Router forwards voice packets to appropriate recipients.
 type Router struct {
 	mu     sync.RWMutex
 	config RouterConfig
 }
 
-// NewRouterWithConfig creates an audio router with full configuration.
-func NewRouterWithConfig(cfg RouterConfig) *Router {
-	return &Router{config: cfg}
-}
-
-// SetVoiceDebug updates the voice debug flag for runtime toggling.
+func NewRouterWithConfig(cfg RouterConfig) *Router { return &Router{config: cfg} }
 func (r *Router) SetVoiceDebug(enabled bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -46,103 +37,71 @@ func (r *Router) SetVoiceDebug(enabled bool) {
 
 var routeLogCount atomic.Uint64
 
-// Route determines recipients and forwards the decrypted packet.
-func (r *Router) Route(senderSessionID uint32, voiceTarget uint8, decryptedPacket []byte) error {
+// Route 只处理音频事实，接收上下文由服务端路由生成。
+func (r *Router) Route(sender uint32, frame ma.Frame) error {
 	r.mu.RLock()
 	cfg := r.config
-	voiceDebug := cfg.VoiceDebug
 	r.mu.RUnlock()
-	if cfg.Sender == nil {
-		if voiceDebug {
-			slog.Warn("[VOICE-DEBUG] Route: no Sender configured")
+	if cfg.Sender == nil || frame.Target > 31 {
+		return nil
+	}
+	frame.SenderSession = sender
+	cache := ma.NewEncodingCache()
+	if frame.Target > 0 && frame.Target < 31 {
+		if cfg.RouteVoiceTarget != nil {
+			return cfg.RouteVoiceTarget(sender, uint8(frame.Target), frame, cache)
 		}
 		return nil
 	}
-
+	if frame.Target == 31 {
+		return cfg.Sender.SendAudio(sender, ma.Delivery{Frame: frame}, cache)
+	}
+	if cfg.CanSenderSpeak != nil && !cfg.CanSenderSpeak(sender) {
+		return nil
+	}
+	if cfg.GetChan == nil || cfg.GetUsersInChan == nil {
+		return nil
+	}
+	recipients := make(map[uint32]ma.Delivery)
+	add := func(sid uint32, context ma.Context, volume float32) {
+		if sid == sender || (cfg.FilterRecipient != nil && !cfg.FilterRecipient(sender, sid)) {
+			return
+		}
+		d := ma.Delivery{Frame: frame, Context: context, VolumeAdjustment: volume}
+		if old, ok := recipients[sid]; ok {
+			d = ma.MergeDelivery(old, d)
+		}
+		recipients[sid] = d
+	}
+	ch := cfg.GetChan(sender)
+	channels := []uint32{ch}
+	if cfg.GetLinkedChans != nil {
+		channels = append(channels, cfg.GetLinkedChans(ch)...)
+	}
+	for _, cid := range channels {
+		if cfg.CanSenderSpeakInChan != nil && !cfg.CanSenderSpeakInChan(sender, cid) {
+			continue
+		}
+		for _, sid := range cfg.GetUsersInChan(cid) {
+			add(sid, ma.ContextNormal, 1)
+		}
+		if cfg.GetListenersInChan != nil {
+			for _, sid := range cfg.GetListenersInChan(cid) {
+				volume := float32(1)
+				if cfg.GetListenerVolume != nil {
+					volume = cfg.GetListenerVolume(sid, cid)
+				}
+				add(sid, ma.ContextListen, volume)
+			}
+		}
+	}
+	for sid, d := range recipients {
+		_ = cfg.Sender.SendAudio(sid, d, cache)
+	}
 	n := routeLogCount.Add(1)
-	shouldLog := voiceDebug && (n <= 5 || n%50 == 0)
+	if cfg.VoiceDebug && (n <= 5 || n%50 == 0) {
+		slog.Info("audio route", "sender", sender, "recipients", len(recipients), "encoding_groups", cache.Groups())
+	}
 
-	var recipients []uint32
-	switch voiceTarget {
-	case 31:
-		recipients = []uint32{senderSessionID}
-	case 0:
-		if cfg.GetChan != nil && cfg.GetUsersInChan != nil {
-			if cfg.CanSenderSpeak != nil && !cfg.CanSenderSpeak(senderSessionID) {
-				if voiceDebug {
-					slog.Warn("[VOICE-DEBUG] Route: CanSenderSpeak=false, dropping",
-						"sender", senderSessionID)
-				}
-				return nil
-			}
-			ch := cfg.GetChan(senderSessionID)
-			channelIDs := []uint32{ch}
-			if cfg.GetLinkedChans != nil {
-				channelIDs = append(channelIDs, cfg.GetLinkedChans(ch)...)
-			}
-			seen := make(map[uint32]bool)
-			consider := func(sid uint32) {
-				if sid == senderSessionID || seen[sid] {
-					return
-				}
-				seen[sid] = true
-				filtered := false
-				if cfg.FilterRecipient != nil && !cfg.FilterRecipient(senderSessionID, sid) {
-					filtered = true
-				}
-				if !filtered {
-					recipients = append(recipients, sid)
-				} else if shouldLog {
-					slog.Info("[VOICE-DEBUG] Route: recipient filtered out",
-						"sender", senderSessionID, "recipient", sid)
-				}
-			}
-			for _, cid := range channelIDs {
-				if cfg.CanSenderSpeakInChan != nil && !cfg.CanSenderSpeakInChan(senderSessionID, cid) {
-					if shouldLog {
-						slog.Info("[VOICE-DEBUG] Route: sender cannot speak in channel, skipping",
-							"sender", senderSessionID, "channel", cid)
-					}
-					continue
-				}
-				usersInChan := cfg.GetUsersInChan(cid)
-				var listeners []uint32
-				if cfg.GetListenersInChan != nil {
-					listeners = cfg.GetListenersInChan(cid)
-				}
-				if shouldLog {
-					slog.Info("[VOICE-DEBUG] Route: channel scan",
-						"sender", senderSessionID, "channel", cid,
-						"users_in_channel", usersInChan, "listeners", listeners)
-				}
-				// Channel listeners hear the channel like occupants without joining it;
-				// `seen` dedups a recipient who is both present and listening.
-				for _, sid := range usersInChan {
-					consider(sid)
-				}
-				for _, sid := range listeners {
-					consider(sid)
-				}
-			}
-		} else if voiceDebug {
-			slog.Warn("[VOICE-DEBUG] Route: GetChan or GetUsersInChan is nil")
-		}
-	default:
-		if voiceTarget >= 1 && voiceTarget <= 30 && cfg.RouteVoiceTarget != nil {
-			return cfg.RouteVoiceTarget(senderSessionID, voiceTarget, decryptedPacket)
-		}
-		if voiceTarget >= 1 && voiceTarget <= 30 && cfg.GetVoiceTarget != nil {
-			recipients = cfg.GetVoiceTarget(senderSessionID, voiceTarget)
-		}
-	}
-	if shouldLog || (voiceDebug && len(recipients) == 0) {
-		slog.Info("[VOICE-DEBUG] Route: forwarding",
-			"sender", senderSessionID, "target", voiceTarget,
-			"recipient_count", len(recipients), "recipients", recipients,
-			"pkt_len", len(decryptedPacket))
-	}
-	for _, sid := range recipients {
-		_ = cfg.Sender.SendAudio(sid, decryptedPacket)
-	}
 	return nil
 }

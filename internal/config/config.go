@@ -12,28 +12,28 @@ import (
 
 // Config holds the server configuration.
 type Config struct {
-	Host           string
-	MumblePort     int
-	RESTPort       int
-	FrontendEmbed  bool
-	DatabasePath   string
-	SSLCertPath    string
-	SSLKeyPath     string
-	MaxUsers       int
-	MaxBandwidth   int
-	LogLevel       string
-	JWTIssuer      string
-	JWTAudience    string
-	JWTExpiryDays  int
-	ChannelDepth   int
-	ChannelCount   int
-	WelcomeText    string
-	ServerPassword string
-	DefaultChannel int
-	CertRequired   bool
-	Bonjour        bool
-	RegisterName   string
-	VoiceDebug     bool
+	Host                      string
+	MumblePort                int
+	RESTPort                  int
+	FrontendEmbed             bool
+	DatabasePath              string
+	SSLCertPath               string
+	SSLKeyPath                string
+	MaxUsers                  int
+	MaxBandwidth              int
+	LogLevel                  string
+	JWTIssuer                 string
+	JWTAudience               string
+	JWTExpiryDays             int
+	ChannelDepth              int
+	ChannelCount              int
+	WelcomeText               string
+	ServerPassword            string
+	DefaultChannel            int
+	CertRequired              bool
+	Bonjour                   bool
+	RegisterName              string
+	VoiceDebug                bool
 	// AllowRecording mirrors murmur's allowRecording: when false a client that
 	// announces it started recording is disconnected instead of being relayed.
 	AllowRecording bool

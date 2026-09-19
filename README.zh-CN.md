@@ -2,17 +2,18 @@
 
 **[English](README.md) | 简体中文**
 
-一个现代化的、从零开始实现的 [Mumble](https://www.mumble.info/) 语音聊天服务器,使用 Go 编写。与所有标准 Mumble 客户端线缆协议兼容(wire-compatible)——可作为原版 Murmur 服务器的直接替代品。
+一个现代化的、从零开始实现的 [Mumble](https://www.mumble.info/) 语音聊天服务器，使用 Go 编写。已实现 Legacy 与 Mumble 1.5 Protobuf Audio 路径。
 
 Mumble 协议实现是一个**可复用的 Go 库**(`pkg/mumble/`),可以独立导入,用于构建客户端、机器人、桥接器或其他工具。
 
-**状态:Beta** —— 功能已完成,可发布 v0.1 版本。[Releases](https://github.com/dchote/go-mumble-server/releases) 提供 Linux amd64/arm64 二进制文件和 .deb 软件包。
+**状态：Beta** —— 核心实现已完成，客户端兼容性验收仍在进行。[Releases](https://github.com/dchote/go-mumble-server/releases) 提供 Linux amd64/arm64 二进制文件和 .deb 软件包。
 
 ## 概述
 
 go-mumble-server 以现代优先级重新构想了 Mumble 服务器:单一静态二进制文件、零运行时依赖、内置 REST 管理 API,并用 Go 简洁的并发模型取代原版的 C++/Qt 复杂性。
 
-**TCP/TLS :64738 上的 Mumble 协议** —— 完整控制通道,原生 Go 消息编码(不使用 protobuf)。
+**TCP/TLS :64738 上的 Mumble 协议** —— 完整控制通道，使用手写 Go wire 编码。
+**Mumble 语音协议** —— 支持 Legacy 和 Mumble 1.5 Protobuf Audio 封包格式；服务端不进行音频转码。
 **UDP :64738 上的语音** —— 低延迟 AEAD 加密音频,支持 TCP 隧道回退。
 **:64730 上的 REST 管理 API** —— 管理与监控,Swagger 文档位于 `/docs`。
 **Web 管理界面** —— Vue 3 + Vuetify 前端嵌入二进制文件中,随 REST API 一起提供服务。
@@ -42,7 +43,7 @@ go-mumble-server 以现代优先级重新构想了 Mumble 服务器:单一静态
 ### 服务器
 
 - **完整的 Mumble 协议** —— 全部 27 种控制消息类型,UDP 和 TCP 语音传输
-- **Opus 音频** —— 首选编解码器,传统客户端可回退到 CELT
+- **Opus 音频** —— 使用 Opus；支持 Legacy 和 Mumble 1.5 Protobuf 封包格式，不进行音频转码
 - **频道层级** —— 树状结构,支持链接、临时频道和频道监听。根据 Mumble 协议,根频道 ID 恒为 0;客户端会收到完整的频道树和用户同步(包括根频道中的用户)。
 - **ACL 权限** —— 基于组的访问控制,支持继承、令牌和逐频道覆盖
 - **文本消息** —— 私聊、频道和全树消息,支持 HTML
@@ -58,7 +59,7 @@ go-mumble-server 以现代优先级重新构想了 Mumble 服务器:单一静态
 ### 协议库
 
 - **可作为 Go 模块导入** —— `import "github.com/dchote/go-mumble-server/pkg/mumble"`
-- **消息类型** —— 全部 27 种控制消息和 UDP 音频消息的原生 Go 结构体(无 protobuf 依赖)
+- **消息类型** —— 全部 27 种控制消息的原生 Go 结构体，以及 Legacy/Protobuf Audio 手写 wire 编码；不依赖 protobuf 运行时
 - **封包成帧** —— 针对 6 字节 TCP 头格式的读写函数
 - **处理器表** —— 服务器和客户端代码均可使用的消息分发基础设施
 - **CryptState** —— UDP 语音封包的 AEAD 加解密(OCB2-AES128 legacy、AES-256-GCM secure 或 lite 直通)

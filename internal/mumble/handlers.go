@@ -1,11 +1,11 @@
 package mumble
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/tls"
 	"encoding/binary"
-	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"net"
@@ -159,10 +159,6 @@ func (s *Server) HandleUDP(addr net.Addr, data []byte) {
 		s.connMu.RUnlock()
 
 		if senderSession == 0 && voiceDebug {
-			firstBytes := 16
-			if len(data) < firstBytes {
-				firstBytes = len(data)
-			}
 			errStr := ""
 			if lastErr != nil {
 				errStr = lastErr.Error()
@@ -183,7 +179,6 @@ func (s *Server) HandleUDP(addr net.Addr, data []byte) {
 			}
 			args := []interface{}{
 				"addr", addrKey, "data_len", len(data),
-				"first_bytes", hex.EncodeToString(data[:firstBytes]),
 				"conn_count", connCount, "tries", tryCount, "last_err", errStr}
 			if downLevel {
 				slog.Debug("[VOICE-DEBUG] HandleUDP: trial decrypt failed, no matching session (same host, different port)", args...)
@@ -210,12 +205,33 @@ func (s *Server) HandleUDP(addr net.Addr, data []byte) {
 		return
 	}
 
-	codecType := (plain[0] >> 5) & 0x7
+	s.connMu.RLock()
+	senderConn := s.conns[senderSession]
+	s.connMu.RUnlock()
+	if senderConn == nil || senderConn.Crypt != senderCrypt || senderConn.State() != connection.StateActive {
+		return
+	}
+	mode := senderConn.AudioWireMode()
+	if len(plain) > mumbleaudio.MaxPacketSize {
+		return
+	}
+	isPing := mode == mumbleaudio.WireLegacy && plain[0]>>5 == 1 || mode == mumbleaudio.WireProtobuf && plain[0] == 1
 
 	// Type 1 = UDP ping: echo back to sender for connectivity confirmation,
 	// but suppress the echo if the sender's channel has mixed crypto modes
 	// (this forces the client to fall back to TCP tunnel).
-	if codecType == 1 {
+	if isPing {
+		timestamp, extended, err := mumbleaudio.DecodePing(mode, plain)
+		if err != nil {
+			return
+		}
+		if mode == mumbleaudio.WireProtobuf {
+			if extended {
+				plain = s.protobufPingReply(plain[1:])
+			} else {
+				plain = appendProtoVarintField([]byte{1}, 1, timestamp)
+			}
+		}
 		cid, ok := s.users.ChannelID(senderSession)
 		mixed := ok && s.channelHasMixedCrypto(cid)
 		if mixed {
@@ -238,24 +254,23 @@ func (s *Server) HandleUDP(addr net.Addr, data []byte) {
 	if s.router == nil {
 		return
 	}
-	target := plain[0] & 0x1F
-	outgoing := rewriteAudioPacket(senderSession, plain)
-	_ = s.router.Route(senderSession, target, outgoing)
+	frame, err := s.decodeAudio(senderConn, plain, "udp")
+	if err != nil {
+		return
+	}
+	_ = s.router.Route(senderSession, frame)
 }
 
-// ServerVersionV1 is the version advertised in the control-channel Version
-// message. Clients gate features on it: >=1.4.0 shows the channel-listening UI
-// (issue #19), but >=1.5.0 makes 1.5 clients negotiate the protobuf UDP voice
-// protocol, which this server cannot parse yet (issue #22) — it speaks legacy
-// varint voice only. Keep the advertisement in the 1.4.x range until #22 lands.
-const ServerVersionV1 = uint32(1<<16 | 4<<8) // 1.4.0 as (major<<16)|(minor<<8)|patch
+// Audio 双格式实现已接入，控制通道默认宣告 1.5.0。
+// 该版本宣告与连接级 WireMode 使用同一协议能力基线。
+const ServerVersionV2 = uint64(1<<48 | 5<<32)
+
+const ServerVersionV1 = uint32(1<<16 | 5<<8) // 1.5.0 as (major<<16)|(minor<<8)|patch
 
 // Version reported in server-list ping replies. This is a display field for
-// public-server listings, not a protocol negotiation: unlike
-// ServerVersionV1 above it does not gate client behavior, so it can advertise
-// 1.5.0 regardless of #22. The legacy format cannot express v2 versions, so
-// both fields carry the same 1.5.0 value in their respective encodings (see
-// Murmur's Version::toLegacyVersion and version_v2 packing).
+// public-server listings, separate from the authenticated Version exchange.
+// The legacy ping format cannot express v2 versions, so both fields carry the
+// same 1.5.0 value in their respective encodings.
 const (
 	pingLegacyVersion  = uint32(1<<16 | 5<<8)  // 1.5.0 as (major<<16)|(minor<<8)|patch
 	pingVersionV2      = uint64(1<<48 | 5<<32) // 1.5.0 as major<<48|minor<<32|patch<<16
@@ -290,25 +305,9 @@ func (s *Server) plainPingReply(data []byte) []byte {
 // the reply echoes the timestamp and fills server_version_v2=3, user_count=4,
 // max_user_count=5, max_bandwidth_per_user=6.
 func (s *Server) protobufPingReply(body []byte) []byte {
-	var timestamp uint64
-	requestInfo := false
-	for i := 0; i < len(body); {
-		key, n := decodeProtoVarint(body[i:])
-		if n <= 0 || key>>3 == 0 || key&7 != 0 {
-			return nil // malformed or non-varint field: not a probe we can answer
-		}
-		i += n
-		val, n := decodeProtoVarint(body[i:])
-		if n <= 0 {
-			return nil
-		}
-		i += n
-		switch key >> 3 {
-		case 1:
-			timestamp = val
-		case 2:
-			requestInfo = val != 0
-		}
+	timestamp, requestInfo, err := mumbleaudio.DecodePing(mumbleaudio.WireProtobuf, append([]byte{1}, body...))
+	if err != nil {
+		return nil
 	}
 	if !requestInfo {
 		return nil
@@ -328,6 +327,9 @@ func (s *Server) protobufPingReply(body []byte) []byte {
 func decodeProtoVarint(b []byte) (uint64, int) {
 	var v uint64
 	for i := 0; i < len(b) && i < 10; i++ {
+		if i == 9 && b[i] > 1 {
+			return 0, -1
+		}
 		v |= uint64(b[i]&0x7f) << (7 * i)
 		if b[i]&0x80 == 0 {
 			return v, i + 1
@@ -350,35 +352,28 @@ func appendProtoVarint(buf []byte, v uint64) []byte {
 	return append(buf, byte(v))
 }
 
-// rewriteAudioPacket converts a client-to-server audio packet into a
-// server-to-client packet by inserting the sender's session ID varint
-// between the header byte and the rest of the payload.
-// Client→server: [header] [sequence] [payload_len] [data...]
-// Server→client: [header] [session]  [sequence]    [payload_len] [data...]
-func rewriteAudioPacket(senderSession uint32, clientPacket []byte) []byte {
-	if len(clientPacket) < 1 {
-		return clientPacket
-	}
-	var sessionBuf [mumbleaudio.MaxVarintLen]byte
-	n := mumbleaudio.EncodeVarint(sessionBuf[:], int64(senderSession))
-	out := make([]byte, 1+n+len(clientPacket)-1)
-	out[0] = clientPacket[0]
-	copy(out[1:], sessionBuf[:n])
-	copy(out[1+n:], clientPacket[1:])
-	return out
-}
-
-// SendAudio implements audio.RecipientSender. Encrypts with recipient's key and sends via UDP, or TCP fallback.
-// When the recipient's channel has mixed crypto modes, UDP is skipped to force TCP tunnel relay.
-func (s *Server) SendAudio(sessionID uint32, packet []byte) error {
+// SendAudio 根据接收连接的模式编码，UDP 和 TCP 回退共用同一明文。
+func (s *Server) SendAudio(sessionID uint32, d mumbleaudio.Delivery, cache *mumbleaudio.EncodingCache) error {
 	s.connMu.RLock()
-	c, ok := s.conns[sessionID]
-	recipientAddr, _ := s.addrBySession.Load(sessionID)
+	c := s.conns[sessionID]
+	addr, _ := s.addrBySession.Load(sessionID)
 	s.connMu.RUnlock()
-	if !ok {
+	return s.sendDeliveryTo(sessionID, c, addr, d, cache)
+}
+func (s *Server) sendDeliveryTo(sessionID uint32, c *connection.Conn, addr interface{}, d mumbleaudio.Delivery, cache *mumbleaudio.EncodingCache) error {
+	if c == nil {
 		return nil
 	}
-	return s.sendAudioTo(sessionID, c, recipientAddr, packet)
+	if d.HasPosition {
+		speaker, ok := s.users.Snapshot(d.SenderSession)
+		recipient, found := s.users.Snapshot(sessionID)
+		d.HasPosition = ok && found && bytes.Equal(speaker.PluginContext, recipient.PluginContext)
+	}
+	packet, err := cache.Encode(c.AudioWireMode(), d)
+	if err != nil {
+		return err
+	}
+	return s.sendAudioTo(sessionID, c, addr, packet)
 }
 
 // sendAudioTo 使用已固定的连接和地址，发送时不再按可复用的 session 查找。
@@ -577,6 +572,7 @@ func NewServer(cfg *config.Config, db *gorm.DB, serverID uint, udpConn net.Packe
 		},
 		GetUsersInChan:     s.users.SessionIDsInChannel,
 		GetListenersInChan: s.listeners.SessionIDsIn,
+		GetListenerVolume:  s.listeners.Volume,
 		RouteVoiceTarget:   s.routeVoiceTarget,
 		GetLinkedChans: func(cid uint32) []uint32 {
 			ids := s.chans.ConnectedChannelIDs(cid)
@@ -1032,6 +1028,10 @@ func (s *Server) handleVersion(msgType protocol.MessageType, payload []byte, ctx
 		slog.Debug("client version", "release", v.Release, "os", v.OS)
 		c.SetClientCryptoModes(v.CryptoModes)
 		c.SetClientVersion(clientVersionFull(v))
+		c.NegotiateAudioWireMode(s.ProtocolVersionV2())
+		if s.voiceDebug.Load() {
+			slog.Info("audio negotiation", "client_version", c.ClientVersion(), "wire_mode", c.AudioWireMode())
+		}
 	}
 	return nil
 }
@@ -2213,61 +2213,14 @@ var udpTunnelCount sync.Map // session -> *uint64
 
 func (s *Server) handleUDPTunnel(msgType protocol.MessageType, payload []byte, ctx interface{}) error {
 	c := ctx.(*connection.Conn)
-	state := c.State()
-	sid := c.SessionID()
-	voiceDebug := s.voiceDebug.Load()
-	if state != connection.StateActive || s.router == nil {
-		if voiceDebug {
-			slog.Warn("[VOICE-DEBUG] UDPTunnel DROPPED: inactive/no-router",
-				"session", sid, "state", state, "router_nil", s.router == nil, "payload_len", len(payload))
-		}
+	if c.State() != connection.StateActive || s.router == nil {
 		return nil
 	}
-	if len(payload) < 1 {
-		if voiceDebug {
-			slog.Warn("[VOICE-DEBUG] UDPTunnel DROPPED: empty payload", "session", sid)
-		}
-		return nil
+	frame, err := s.decodeAudio(c, payload, "tcp")
+	if err != nil {
+		return err
 	}
-
-	// Rate-limit logging: first 5 packets, then every 50th (only when voice_debug enabled)
-	countPtr, _ := udpTunnelCount.LoadOrStore(sid, new(uint64))
-	count := countPtr.(*uint64)
-	*count++
-	shouldLog := voiceDebug && (*count <= 5 || *count%50 == 0)
-
-	codecType := (payload[0] >> 5) & 0x07
-	target := uint8(payload[0] & 0x1F)
-	if shouldLog {
-		slog.Info("[VOICE-DEBUG] UDPTunnel received",
-			"session", sid, "pkt_num", *count, "payload_len", len(payload),
-			"header_byte", fmt.Sprintf("0x%02x", payload[0]),
-			"codec_type", codecType, "target", target,
-			"first_bytes", hex.EncodeToString(payload[:min(len(payload), 16)]))
-
-		canSpeak := s.canSenderSpeak(sid)
-		u, uOk := s.users.Snapshot(sid)
-		if uOk {
-			slog.Info("[VOICE-DEBUG] sender info",
-				"session", sid, "user_id", u.UserID, "channel_id", u.ChannelID,
-				"mute", u.Mute, "self_mute", u.SelfMute, "can_speak", canSpeak)
-		} else {
-			slog.Warn("[VOICE-DEBUG] sender NOT FOUND in user manager", "session", sid)
-		}
-	}
-
-	outgoing := rewriteAudioPacket(sid, payload)
-	if shouldLog {
-		slog.Info("[VOICE-DEBUG] rewritten packet",
-			"session", sid, "in_len", len(payload), "out_len", len(outgoing),
-			"out_first_bytes", hex.EncodeToString(outgoing[:min(len(outgoing), 20)]))
-	}
-
-	err := s.router.Route(sid, target, outgoing)
-	if err != nil && voiceDebug {
-		slog.Error("[VOICE-DEBUG] Route returned error", "session", sid, "err", err)
-	}
-	return nil
+	return s.router.Route(c.SessionID(), frame)
 }
 
 func (s *Server) handleBanList(msgType protocol.MessageType, payload []byte, ctx interface{}) error {
@@ -2450,4 +2403,31 @@ func (s *Server) handlePluginDataTransmission(msgType protocol.MessageType, payl
 	_ = ctx
 	_ = payload
 	return nil
+}
+
+// ProtocolVersionV1/V2 返回服务端当前正式宣告的协议能力。
+func (s *Server) ProtocolVersionV1() uint32 {
+	return ServerVersionV1
+}
+func (s *Server) ProtocolVersionV2() uint64 {
+	return ServerVersionV2
+}
+
+var audioParseCount atomic.Uint64
+var audioParseFailures atomic.Uint64
+
+func (s *Server) decodeAudio(c *connection.Conn, payload []byte, transport string) (mumbleaudio.Frame, error) {
+	frame, err := mumbleaudio.DecodeClientPacket(c.AudioWireMode(), payload)
+	if s.voiceDebug.Load() {
+		count := audioParseCount.Add(1)
+		if err != nil {
+			failed := audioParseFailures.Add(1)
+			if failed <= 5 || failed%50 == 0 {
+				slog.Warn("audio parse failed", "session", c.SessionID(), "wire_mode", c.AudioWireMode(), "transport", transport, "count", failed, "error", err)
+			}
+		} else if count <= 5 || count%50 == 0 {
+			slog.Info("audio received", "session", c.SessionID(), "wire_mode", c.AudioWireMode(), "transport", transport, "target", frame.Target, "count", count)
+		}
+	}
+	return frame, err
 }

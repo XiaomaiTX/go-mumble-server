@@ -1,188 +1,72 @@
-# Voice Data (UDP / UDPTunnel)
+# 语音数据（UDP / UDPTunnel）
 
-> **Status:** Reference — derived from `research/mumble/src/MumbleUDP.proto` and `research/gumble/gumble/handlers.go`
+状态：Legacy/Protobuf 双格式实现已接入；控制通道默认宣告 1.5.0。1.5 客户端使用 Protobuf Audio，旧客户端继续使用 Legacy；真实客户端互操作按验收清单执行。
 
-## Overview
+## 协商与传输
 
-Voice data travels over UDP (encrypted with an AEAD cipher) or is tunneled over the TCP control channel via `UDPTunnel` (message type 1). Two packet formats exist: the legacy binary format and the modern wire format (introduced in Mumble 1.5.0, similar encoding style). The encryption algorithm is [negotiated per client](security-modes.md) — OCB2-AES128 (legacy), AES-256-GCM (secure), or none (lite).
+连接在认证前根据双方版本确定音频格式：双方均达到 1.5.0 才使用 Protobuf，否则使用 Legacy。未知版本使用 Legacy。认证后固定格式，UDP 与 TCP `UDPTunnel` 共用；不能通过音频首字节猜测并切换格式。未认证服务器列表 Ping 保留两种格式识别。
 
-## Transport
+UDP 默认端口 64738，与 TCP/TLS 端口一致。音频明文最多 1024 字节，限制不含加密开销。加密层与音频格式独立：OCB2-AES128、AES-256-GCM、lite 明文仍由现有加密能力协商决定。TCP 回退传送同一接收者格式的明文包；mixed-crypto 频道强制 TCP，也不会改变 wire mode。
 
-### UDP
+## Legacy Opus 格式
 
-- Same port as TCP (default 64738).
-- Encrypted with AEAD cipher — OCB2-AES128 (legacy), AES-256-GCM (secure), or cleartext (lite). Each client has a unique key and nonce pair (or none for lite).
-- Maximum packet size: 1024 bytes.
-- Preferred transport for low latency.
-- **UDP ping (codec type 1):** Clients send pings (encrypted in legacy/secure, cleartext in lite) to test connectivity; the server echoes them back unless the channel has mixed crypto modes (then the server suppresses the echo to force TCP). Without the echo, clients assume UDP is unavailable and fall back to TCP tunneling.
-- Encryption overhead: 0 bytes (lite), 4 bytes (legacy), or 28 bytes (secure). See [encryption.md](encryption.md).
-
-### TCP Tunnel (UDPTunnel)
-
-- Used when UDP is unavailable (NAT, firewall).
-- Message type 1 in the TCP framing — the payload is the raw (decrypted) audio packet.
-- Higher latency due to TCP head-of-line blocking.
-- Clients auto-detect UDP availability and fall back to TCP.
-- The server forwards voice to recipients via either UDP or TCP tunnel, depending on whether the recipient has established UDP connectivity (has sent at least one UDP packet) and whether the recipient's channel has mixed crypto modes (mixed-mode channels always use TCP tunnel).
-
-## Legacy Binary Format
-
-Used in all Mumble versions. Still the format inside `UDPTunnel` for legacy clients.
-
-### Packet Structure
-
-```
-┌─────────────────────────────────┐
-│ Header Byte                     │
-│ ┌───────────┬─────────────────┐ │
-│ │ Codec (3) │ Target (5 bits) │ │
-│ └───────────┴─────────────────┘ │
-├─────────────────────────────────┤
-│ Session (varint)                │  ← server→client only
-├─────────────────────────────────┤
-│ Sequence Number (varint)        │
-├─────────────────────────────────┤
-│ Payload Length (varint)         │  ← bit 13 = terminator flag
-├─────────────────────────────────┤
-│ Audio Frame Data                │
-├─────────────────────────────────┤
-│ Positional Audio (optional)     │
-│ 3 × float32 (X, Y, Z)         │
-│ = 12 bytes, little-endian      │
-└─────────────────────────────────┘
+```text
+客户端：header | frame_number | payload_length | opus_data | 可选位置
+服务端：header | sender_session | frame_number | payload_length | opus_data | 可选位置
 ```
 
-### Header Byte
+header 高三位是 codec，Opus 为 4，Ping 为 1。低五位在客户端方向是 target，在服务端方向是 context。整数使用 Mumble 自定义 varint；`payload_length` 低 13 位是字节数，第 13 位（0x2000）是终止标记。位置数据只能不存在或恰好为三个 little-endian float32（12 字节）。本次音频入口只接受非空 Opus，不实现 CELT/Speex 转码。
 
-| Bits | Field | Description |
-|------|-------|-------------|
-| 7–5 | Codec | Audio codec identifier |
-| 4–0 | Target | Voice target (see below) |
+| 客户端 target | 路由 |
+| --- | --- |
+| 0 | 当前频道及链接频道 |
+| 1～30 | 预先配置的 VoiceTarget |
+| 31 | 服务器回环 |
 
-### Codec IDs
+旧公开接口 `ParsePacket` 保留兼容包装，新增位置字段；生产入口使用 `DecodeClientPacket` 严格校验。
 
-| ID | Codec | Notes |
-|----|-------|-------|
-| 0 | CELT Alpha | Legacy, version-specific |
-| 1 | Ping | UDP connectivity test; server echoes back |
-| 2 | Speex | Deprecated |
-| 3 | CELT Beta | Legacy, version-specific |
-| 4 | Opus | Preferred, required for modern clients |
+## Protobuf Audio 格式
 
-### Voice Targets
-
-| Target | Meaning |
-|--------|---------|
-| 0 | Normal — current channel + linked channels |
-| 1–30 | Whisper — uses `VoiceTarget` configuration for this ID |
-| 31 | Server loopback — echo back to sender |
-
-### Varint Encoding
-
-Mumble uses a custom varint encoding:
-
-| First byte pattern | Value range | Bytes used |
-|---------------------|-------------|------------|
-| `0xxxxxxx` | 0 – 127 | 1 |
-| `10xxxxxx` + 1 byte | 0 – 16,383 | 2 |
-| `110xxxxx` + 2 bytes | 0 – 2,097,151 | 3 |
-| `1110xxxx` + 3 bytes | 0 – 268,435,455 | 4 |
-| `11110000` + 4 bytes | 32-bit value | 5 |
-| `11110100` + 8 bytes | 64-bit value | 9 |
-| `11111100` | Negative recursive | variable |
-| `11111000` | Negative 2's complement recursive | variable |
-
-Reference: `research/gumble/gumble/varint/read.go` and `write.go`.
-
-### Session Field
-
-- **Client→server:** Session is **not** included. The server identifies the sender by the source UDP address and decryption key.
-- **Server→client:** Session **is** included so recipients know who is speaking.
-
-### Terminator Flag
-
-Bit 13 of the payload length varint indicates this is the last audio frame in a speech sequence (the user stopped talking). Clients use this to fade out audio smoothly.
-
-## Modern UDP Format (Protocol 1.5+)
-
-Modern clients may use wire-encoded UDP packets. We implement this with native Go structs; the upstream spec is in `MumbleUDP.proto` (reference only).
-
-### Audio Message
-
-```protobuf
-message Audio {
-    uint32 target = 1;
-    uint32 context = 2;
-    uint32 sender_session = 3;
-    uint64 frame_number = 4;
-    bytes  opus_data = 5;
-    repeated float positional_data = 6;
-    float  volume_adjustment = 7;
-    bool   is_terminator = 8;
-}
+```text
+0x00 | protobuf(MumbleUDP.Audio)
 ```
 
-| Field | Description |
-|-------|-------------|
-| `target` | Voice target (0 = normal, 1–30 = whisper, 31 = loopback) |
-| `context` | 0 = normal, 1 = shout to linked channels |
-| `sender_session` | Set by server when forwarding |
-| `frame_number` | Incrementing frame counter |
-| `opus_data` | Opus-encoded audio frame |
-| `positional_data` | X, Y, Z coordinates for positional audio |
-| `volume_adjustment` | Per-listener volume multiplier |
-| `is_terminator` | End of speech sequence |
+| 字段 | 编号 | wire type | 语义 |
+| --- | ---: | --- | --- |
+| target | 1 | varint | 客户端指定路由目标 |
+| context | 2 | varint | 服务端指定接收上下文 |
+| sender_session | 3 | varint | 服务端认证的发送者身份 |
+| frame_number | 4 | varint | 当前包第一帧的序号 |
+| opus_data | 5 | length-delimited | 非空 Opus 数据 |
+| positional_data | 6 | packed fixed32 | 可选三个位置坐标 |
+| volume_adjustment | 7 | fixed32 | 接收者音量 factor；0 表示未设置 |
+| is_terminator | 16 | varint | 语音流结束 |
 
-### Ping Message (UDP)
+`target` 与 `context` 构成 oneof，最后出现的成员生效。singular 重复字段取最后值。编码位置时使用 packed，解码同时接受 packed/unpacked。未知合法字段（含配对 group）跳过；非法 tag、wire type、整数溢出、截断、错误坐标数和超长包拒绝。解码结果独立拥有 Opus 字节，后续读循环可安全复用输入缓冲区。
 
-```protobuf
-message Ping {
-    uint64 timestamp = 1;
-    bool   request_extended_information = 2;
-    uint64 server_version_v2 = 3;
-    uint32 user_count = 4;
-    uint32 max_user_count = 5;
-    uint32 max_bandwidth_per_user = 6;
-}
-```
+客户端提交的 sender/context/volume 不作为授权或交付属性：入口清除 sender，路由以认证 Session 覆盖，context 和音量从服务端状态计算。出站只写 context，不写 target。终止字段的 tag 为 `80 01`，字段号不是 8。
 
-UDP pings are used for latency measurement and to maintain NAT mappings.
+## 路由与交付
 
-### Packet Type Discrimination
+| 来源 | Context |
+| --- | --- |
+| 当前频道、普通链接频道 | NORMAL（0） |
+| VoiceTarget 频道及其子频道/链接目标 | SHOUT（1） |
+| VoiceTarget 显式用户 | WHISPER（2） |
+| 频道 Listener | LISTEN（3） |
+| 服务器回环 | NORMAL（0） |
 
-Modern wire-format UDP packets are distinguished from legacy packets by the first byte:
+重复接收者只交付一次，context 取较小值，音量 factor 独立取较大值。未设置监听音量时采用单位增益 1；Protobuf 编码省略单位增益。Legacy 保留 context，无法携带音量字段。只有发送者与接收者 plugin context 相等时才保留位置。
 
-- Legacy packets: first byte has codec in bits 7–5 (values 0–7, so byte is 0x00–0xFF with specific patterns)
-- Protobuf packets: prefixed with a type byte matching `MumbleUDP` message types
+现有 Mute/SelfMute/Suppress、Deaf/SelfDeaf、Speak/Whisper ACL、逐链接频道权限与 VoiceTarget 连接身份绑定继续生效。服务端不解码 Opus 内容、不重采样、不转码。
 
-The server must support both formats for backward compatibility.
+## Ping
 
-## Audio Routing on the Server
+现代 Ping 为 `0x01 | protobuf(MumbleUDP.Ping)`，字段 1 为 timestamp，字段 2 为请求扩展信息；响应扩展字段 3～6 依次为 VersionV2、在线人数、人数上限、带宽上限。连接内探测严格按 wire mode 校验，普通探测回显时间戳。mixed-crypto 频道抑制连接内 UDP Ping 回应，促使客户端切换 TCP。
 
-The server does **not** decode or transcode audio. It inspects only the header to determine:
+## 对照与验收
 
-1. **Who sent it** — From the UDP source address / crypto state, or the TCP session.
-2. **Where to route it** — From the voice target field.
-3. **Who receives it** — Computed from channel membership, links, listeners, and whisper targets.
-
-For each recipient, the server:
-
-1. Adds the sender's session ID (for server→client format).
-2. If the recipient's channel has mixed crypto modes, always uses TCP tunnel (no UDP).
-3. Otherwise, encrypts with the recipient's key — OCB2-AES128 (legacy), AES-256-GCM (secure), or cleartext (lite) — and sends via UDP if the recipient has a known UDP address.
-4. Or wraps in a `UDPTunnel` TCP frame when UDP is unavailable or mixed-mode forces relay.
-
-## Bandwidth Enforcement
-
-- Server enforces per-user bandwidth limits.
-- Tracked via `BandwidthRecord` — a sliding window of recent audio bytes.
-- Users exceeding the limit are suppressed (audio is dropped, not forwarded).
-- Server sends `UserState` with `suppress = true` when suppressing.
-
-## Reference
-
-- Protocol reference: `research/mumble/src/MumbleUDP.proto` (reference only; we use native Go encoding)
-- Legacy format: `research/gumble/gumble/handlers.go` (`handleUDPTunnel`)
-- Varint: `research/gumble/gumble/varint/`
-- Audio routing: `research/mumble/src/murmur/Server.cpp` (`processMsg`)
-- Receiver grouping: `research/mumble/src/murmur/AudioReceiverBuffer.h`
+- [官方 v1.5.915 MumbleUDP.proto](https://github.com/mumble-voip/mumble/blob/v1.5.915/src/MumbleUDP.proto)：字段定义；仓库固定副本位于 `pkg/mumble/audio/testdata/MumbleUDP.proto`。
+- [官方 MumbleProtocol.cpp](https://github.com/mumble-voip/mumble/blob/v1.5.915/src/MumbleProtocol.cpp)：前缀、Legacy context、位置与单位增益处理。
+- [官方 AudioReceiverBuffer.cpp](https://github.com/mumble-voip/mumble/blob/v1.5.915/src/murmur/AudioReceiverBuffer.cpp)：重复接收者、上下文与音量合并、位置过滤。
+- [实施与互操作记录](../spec/draft/0013-mumbleudp-audio-validation.md)：自动测试结果和待验收项目。

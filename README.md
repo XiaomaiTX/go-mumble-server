@@ -2,17 +2,17 @@
 
 **English | [简体中文](README.zh-CN.md)**
 
-A modern, from-scratch implementation of the [Mumble](https://www.mumble.info/) voice chat server written in Go. Wire-compatible with all standard Mumble clients — drop-in replacement for the original Murmur server.
+A modern, from-scratch implementation of the [Mumble](https://www.mumble.info/) voice chat server written in Go. Legacy and Mumble 1.5 Protobuf Audio paths are implemented.
 
 The Mumble protocol implementation is a **reusable Go library** (`pkg/mumble/`) that can be imported independently to build clients, bots, bridges, or other tools.
 
-**Status: Beta** — Functionally complete; ready for v0.1 release. [Releases](https://github.com/dchote/go-mumble-server/releases) provide Linux amd64/arm64 binaries and .deb packages.
+**Status: Beta** — Core implementation complete; client compatibility acceptance is ongoing. [Releases](https://github.com/dchote/go-mumble-server/releases) provide Linux amd64/arm64 binaries and .deb packages.
 
 ## Overview
 
 go-mumble-server re-imagines the Mumble server with modern priorities: a single static binary, zero runtime dependencies, built-in REST management API, and Go's straightforward concurrency model replacing the original's C++/Qt complexity.
 
-**Mumble protocol on TCP/TLS :64738** — Full control channel with native Go message encoding (no protobuf).
+**Mumble protocol on TCP/TLS :64738** — Full control channel with hand-written Go wire encoding.
 **Voice on UDP :64738** — Low-latency AEAD-encrypted audio with TCP tunnel fallback.
 **REST management API on :64730** — Administration and monitoring with Swagger docs at `/docs`.
 **Web management UI** — Vue 3 + Vuetify frontend embedded in the binary, served alongside the REST API.
@@ -42,7 +42,7 @@ go-mumble-server re-imagines the Mumble server with modern priorities: a single 
 ### Server
 
 - **Full Mumble protocol** — All 27 control message types, UDP and TCP voice transport
-- **Opus audio** — Preferred codec with CELT fallback for legacy clients
+- **Opus audio** — Opus voice with Legacy and Mumble 1.5 Protobuf packet formats; the server does not transcode audio
 - **Channel hierarchy** — Tree structure with linking, temporary channels, and channel listeners. Root channel ID is always 0 per Mumble protocol; clients receive full channel tree and user sync (including users in root).
 - **ACL permissions** — Group-based access control with inheritance, tokens, and per-channel overrides
 - **Text messaging** — Private, channel, and tree-wide messages with HTML support
@@ -58,7 +58,7 @@ go-mumble-server re-imagines the Mumble server with modern priorities: a single 
 ### Protocol Library
 
 - **Importable as a Go module** — `import "github.com/dchote/go-mumble-server/pkg/mumble"`
-- **Message types** — Native Go structs for all 27 control messages and UDP audio messages (no protobuf dependency)
+- **Message types** — Native Go control-message types plus hand-written Legacy and Protobuf Audio wire encoding, with no protobuf runtime dependency
 - **Packet framing** — Read/write functions for the 6-byte TCP header format
 - **Handler table** — Message dispatch infrastructure usable by both server and client code
 - **CryptState** — AEAD encrypt/decrypt for UDP voice packets (OCB2-AES128 legacy, AES-256-GCM secure, or lite pass-through)
@@ -150,7 +150,7 @@ services:
     volumes:
       - mumble-data:/data
       - ./configs/mumble-server.toml:/config/mumble-server.toml:ro
-      # - ./certs:/certs:ro          # 私有 CA 或 mTLS 证书目录
+      # - ./certs:/certs:ro          # Private CA or mTLS certificate directory
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:64730/health"]
@@ -165,8 +165,8 @@ volumes:
 
 Notes:
 
-- 外部身份部署可先执行 `cp .env.example .env`，再填写两个不同方向的服务令牌；`.env` 已被 Git 忽略。
-- SQLite 数据位于 `mumble-data` 命名卷；TOML 在每次启动时读取。认证模式、URL、实例 ID、超时和证书路径统一写入 TOML，两个身份令牌通过宿主机环境、`.env`（不要提交）或容器平台 Secret 注入。修改身份配置后需要重启容器。
+- For external identity deployments, run `cp .env.example .env` and fill in the two separate service tokens; `.env` is ignored by Git.
+- SQLite data is stored in the `mumble-data` named volume and TOML is read at startup. Authentication mode, URLs, instance ID, timeouts, and certificate paths are configured in TOML; inject both identity tokens through the host environment, `.env` (do not commit it), or your container platform's secrets. Restart the container after changing identity settings.
 - The image starts as root, fixes `/data` ownership, then drops privileges to the built-in `mumble` user (UID/GID 999). Bind-mounted data directories work out of the box regardless of the host directory's owner.
 - On images built before this behavior existed (≤ commit `f5e651f`), fix a bind-mounted data directory manually:
   `mkdir -p mumble-data && sudo chown 999:999 mumble-data` — or switch to a named volume.
@@ -233,11 +233,11 @@ Managed via REST API (`/api/v1/meta/config`, `/api/v1/servers/:id/config`) and t
 
 See [docs/technical-overview.md](docs/technical-overview.md) for the full configuration reference.
 
-### 外部身份提供者
+### External Identity Provider
 
-`[auth].mode` 默认为 `local`，保持本地 registered user、密码和证书登录兼容。设为 `external` 后，协议层只通过 External HTTP Identity Provider 完成认证和稳定 ID↔名称查询；provider 的 `deny` 会拒绝登录，超时、5xx 或无效响应同样 fail closed，绝不会回退到本地账户。
+`[auth].mode` defaults to `local`, which preserves local registered-user, password, and certificate login. Set it to `external` to authenticate and resolve stable IDs through an External HTTP Identity Provider; provider `deny`, timeouts, 5xx responses, and invalid responses all fail closed without falling back to local accounts.
 
-提供者的认证与目录 endpoint 分别由 `authenticate_path` 和 `resolve_path` 配置，默认采用 `/api/internal/mumble/v1/...`，可适配其它 HTTP 身份系统而无需修改核心代码。认证响应必须给出非零 stable user ID、canonical name 和可选的权威运行时组。客户端 access token 与权威组分别保存，权威组不持久化到 SQLite；在线会话会按 `revalidate_interval_seconds` 重验，并受 `stale_grace_seconds` 约束。详见[外部身份提供者接入文档](docs/fuxi-seat-external-identity.md)。
+Configure the provider's authentication and directory endpoints with `authenticate_path` and `resolve_path`; the defaults use `/api/internal/mumble/v1/...` and can be adapted without changing core code. Authentication responses must include a non-zero stable user ID, a canonical name, and optional authoritative runtime groups. Client access tokens and authoritative groups are stored separately; groups are not persisted to SQLite. Live sessions are revalidated according to `revalidate_interval_seconds` and bounded by `stale_grace_seconds`. See [External Identity Provider](docs/fuxi-seat-external-identity.md).
 
 ## Web Management UI
 
@@ -310,9 +310,9 @@ for {
 }
 ```
 
-The library handles framing, native Go message encoding (no protobuf), CryptState for UDP, audio packet parsing, and provides all the core Mumble types.
+The library handles framing, native Go control-message encoding, hand-written Legacy/Protobuf Audio wire encoding, CryptState for UDP, and all core Mumble types without a protobuf runtime dependency.
 
-**Protocol policy:** Do not use Google protobuf. See [docs/architecture/protocol-encoding.md](docs/architecture/protocol-encoding.md). Your code provides the connection management and handler logic.
+**Protocol policy:** Do not add the Google protobuf runtime or generated code; both control messages and Audio wire use the project's hand-written encoding strategy. See [docs/architecture/protocol-encoding.md](docs/architecture/protocol-encoding.md).
 
 See [docs/technical-overview.md](docs/technical-overview.md) for the full package layout and the library/server boundary.
 
@@ -369,7 +369,7 @@ go-mumble-server/
 │   └── yarn.lock
 ├── pkg/
 │   └── mumble/                  # ── Public Protocol Library ──
-│       ├── protocol/messages/   # Native Go message structs (no protobuf)
+│       ├── protocol/messages/   # Native Go control-message structs
 │       ├── protocol/            # Packet framing, message types, handler table
 │       ├── crypto/              # CryptState (legacy + secure modes)
 │       ├── audio/               # Audio packets, varint, codec IDs
@@ -413,6 +413,7 @@ go-mumble-server/
 - [Control Messages](docs/protocol/control-messages.md) — TCP message catalog (types 0–26)
 - [Protocol Encoding](docs/architecture/protocol-encoding.md) — Native Go wire encoding, proto2 field presence, snapshot-vs-delta-echo rule, schema conformance lint
 - [Voice Data](docs/protocol/voice-data.md) — UDP audio packet format and routing
+- [MumbleUDP Audio](docs/features/0010-mumbleudp-audio.md) — Legacy and Mumble 1.5 Protobuf Audio support
 - [Security Modes](docs/protocol/security-modes.md) — Per-client crypto tiers (legacy, secure, lite) and mixed-mode enforcement
 - [Encryption](docs/protocol/encryption.md) — TLS, AEAD ciphers, password hashing
 - [Permissions](docs/protocol/permissions.md) — Permission bitmask definitions

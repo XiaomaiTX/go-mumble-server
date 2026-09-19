@@ -1,8 +1,8 @@
 # Product Overview
 
-**go-mumble-server** is a modern, from-scratch implementation of the Mumble voice chat server written in Go. It implements the full Mumble protocol and is wire-compatible with all existing Mumble clients — any standard Mumble client can connect and use it as a drop-in replacement for the original Murmur server.
+**go-mumble-server** is a modern, from-scratch implementation of the Mumble voice chat server written in Go. Legacy and Mumble 1.5 Protobuf Audio paths are implemented.
 
-**Status: Beta** — Functionally complete; v0.1 release ready.
+**Status: Beta** — Core implementation complete; client compatibility acceptance is ongoing.
 
 The project is structured as two layers: a **reusable Mumble protocol library** (`pkg/`) that can be imported by any Go project, and a **production server** built on top of it. The library provides everything needed to implement Mumble clients, bots, bridges, or alternative servers in Go.
 
@@ -23,10 +23,10 @@ The original Mumble server (Murmur) is a mature C++/Qt application that has serv
 The public Go packages provide the building blocks for any Mumble protocol implementation:
 
 - **`pkg/mumble`** — Core types: `Channel`, `User`, `Permission`. Shared by both client and server code.
-- **`pkg/mumble/protocol/messages`** — Native Go structs for all Mumble control messages and UDP audio messages (no protobuf), including ACL, ban, voice target, text message, and version payloads on the wire.
+- **`pkg/mumble/protocol/messages`** — Native Go structs for Mumble control messages; `pkg/mumble/audio` provides hand-written Legacy and Protobuf Audio wire encoding without a protobuf runtime dependency.
 - **`pkg/mumble/protocol`** — Packet framing (read/write with the 6-byte TCP header), message type constants, handler table infrastructure, and varint codec for audio packets.
 - **`pkg/mumble/crypto`** — `CryptState` for UDP voice encryption/decryption. Supports both OCB2-AES128 (legacy) and AES-256-GCM (secure) modes.
-- **`pkg/mumble/audio`** — Audio packet parsing, voice target resolution types, and codec negotiation constants.
+- **`pkg/mumble/audio`** — Legacy and Protobuf Audio encoding, the Frame/Delivery model, positional data, and wire-mode negotiation.
 
 These packages have no dependency on the server — they are pure protocol primitives.
 
@@ -111,7 +111,7 @@ go-mumble-server targets full compatibility with the Mumble protocol as defined 
 - **Control channel** — TCP with TLS, Mumble protocol messages (27 message types, native Go encoding)
 - **Voice channel** — UDP with AEAD encryption, or tunneled over TCP
 - **Per-client negotiation** — Legacy (default), secure, or lite; standard Mumble clients use legacy automatically
-- **Version negotiation** — Supports protocol version exchange and codec negotiation (Opus preferred, CELT fallback)
+- **Version negotiation** — Version exchange with Opus audio support
 - **Proto2 field presence** — `UserState` uses Murmur's snapshot-vs-delta-echo rule: join/roster snapshots emit only `true` voice flags; mute-toggle echoes carry only the fields the client sent (plus cascade synthesised clears), so Mumla/Plumble can unmute without spamming unrelated presence events ([0007](features/0007-userstate-field-presence.md))
 - **Murmur authorization rules** — SuperUser immunity, temporary-channel mute escalation checks, cross-user comment/texture restrictions, channel capacity, message size limits, recording policy and `UserState` rate limiting all follow upstream behaviour ([0008](features/0008-userstate-authorization-and-limits.md))
 
