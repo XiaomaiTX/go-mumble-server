@@ -2078,6 +2078,9 @@ func (s *Server) handleTextMessage(msgType protocol.MessageType, payload []byte,
 	if len(tm.TreeID) > 0 {
 		for _, tid := range tm.TreeID {
 			for _, cid := range s.chans.SubtreeIDs(tid) {
+				if !s.aclCheck(acl.SubjectOf(u), cid, mumble.PermissionTextMessage) {
+					continue
+				}
 				recipients = append(recipients, s.users.SessionIDsInChannel(cid)...)
 			}
 		}
