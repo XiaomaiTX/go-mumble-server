@@ -2206,15 +2206,15 @@ func (s *Server) handleBanList(msgType protocol.MessageType, payload []byte, ctx
 	if len(payload) > 0 {
 		_ = bl.Unmarshal(payload)
 	}
-	if !bl.Query && len(bl.Bans) > 0 {
-		u, ok := s.users.Snapshot(c.SessionID())
-		if !ok {
-			return nil
-		}
-		if !s.aclCheck(acl.SubjectOf(u), s.chans.RootID(), mumble.PermissionBan) {
-			_ = c.WriteMessage(protocol.MessagePermissionDenied, &messages.PermissionDenied{Type: messages.DenyPermission, Reason: "No ban permission"})
-			return nil
-		}
+	u, ok := s.users.Snapshot(c.SessionID())
+	if !ok {
+		return nil
+	}
+	if !s.aclCheck(acl.SubjectOf(u), s.chans.RootID(), mumble.PermissionBan) {
+		_ = c.WriteMessage(protocol.MessagePermissionDenied, &messages.PermissionDenied{Type: messages.DenyPermission, Reason: "No ban permission"})
+		return nil
+	}
+	if !bl.Query {
 		if err := s.bans.Replace(bl.Bans); err != nil {
 			slog.Debug("ban list replace failed", "err", err)
 			return nil
