@@ -302,7 +302,8 @@ function hasPerm(mask, val) {
 }
 
 function togglePerm(val) {
-  permEditValue.value = setPermission(permEditValue.value, val, permField.value === 'grant')
+  const enabled = (permEditValue.value & val) !== 0
+  permEditValue.value = setPermission(permEditValue.value, val, !enabled)
   if (permEditIndex.value >= 0 && editedACLs.value[permEditIndex.value]) {
     editedACLs.value[permEditIndex.value][permField.value] = permEditValue.value
   }
