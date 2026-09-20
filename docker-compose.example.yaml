@@ -1,0 +1,21 @@
+services:
+  go-mumble-server:
+    build: .
+    command: ["-config", "/config/mumble-server.toml"]
+    ports:
+      - "64738:64738/tcp"
+      - "64738:64738/udp"
+      - "64730:64730/tcp"
+    environment:
+      MUMBLE_DATABASE_PATH: /data/mumble-server.sqlite
+    volumes:
+      - ./mumble-data:/data
+      - ./configs/mumble-server.toml:/config/mumble-server.toml:ro
+      # - ./certs:/certs:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:64730/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 5s

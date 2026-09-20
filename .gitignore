@@ -60,3 +60,4 @@ research/
 
 # 本地 Go 验证缓存
 .cache/go-build/
+certs/
