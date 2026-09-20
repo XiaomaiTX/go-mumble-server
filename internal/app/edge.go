@@ -2,11 +2,14 @@ package app
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 
+	"github.com/dchote/go-mumble-server/internal/cluster"
 	"github.com/dchote/go-mumble-server/internal/config"
 	"github.com/dchote/go-mumble-server/internal/edge"
 	"github.com/dchote/go-mumble-server/internal/transport"
+	"golang.org/x/sync/errgroup"
 )
 
 // buildEdgeRuntime composes edge mode: the shared client transport plus the
@@ -15,7 +18,15 @@ import (
 // state, no Core voice router, no REST plane — a missing or unreachable Core
 // fails closed instead of being substituted by a local one.
 func buildEdgeRuntime(ctx context.Context, cfg *config.Config) (*App, error) {
-	remoteCore, err := edge.NewRemoteCoreClient(cfg.CoreAddress, cfg.CoreCACertPath)
+	var tlsConfig *tls.Config
+	var err error
+	if cfg.CoreCACertPath != "" && cfg.EdgeClientCertPath != "" {
+		tlsConfig, err = edgeCoreTLS(cfg)
+		if err != nil {
+			return nil, err
+		}
+	}
+	remoteCore, err := edge.NewRemoteCoreClientWithConfig(edge.RemoteCoreClientConfig{Address: cfg.CoreAddress, EdgeID: cluster.EdgeID(cfg.EdgeID), TLSConfig: tlsConfig, ReconnectMin: cfg.EdgeReconnectMin, ReconnectMax: cfg.EdgeReconnectMax, HeartbeatInterval: cfg.EdgeHeartbeatInterval, HeartbeatTimeout: cfg.EdgeHeartbeatTimeout, QueueSize: cfg.EdgeQueueSize})
 	if err != nil {
 		return nil, fmt.Errorf("remote core client: %w", err)
 	}
@@ -52,7 +63,14 @@ type edgeModeRuntime struct {
 	remoteCore edge.RemoteCore
 }
 
-func (e *edgeModeRuntime) Run(ctx context.Context) error { return e.client.Run(ctx) }
+func (e *edgeModeRuntime) Run(ctx context.Context) error {
+	g, gctx := errgroup.WithContext(ctx)
+	g.Go(func() error { return e.client.Run(gctx) })
+	if transport, ok := e.remoteCore.(edge.RemoteCoreTransport); ok {
+		g.Go(func() error { return transport.Start(gctx) })
+	}
+	return g.Wait()
+}
 
 func (e *edgeModeRuntime) Shutdown(_ context.Context) error {
 	_ = e.remoteCore.Close()

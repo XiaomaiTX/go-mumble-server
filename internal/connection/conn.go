@@ -290,10 +290,7 @@ func (c *Conn) replyPing(payload []byte) {
 		resp.Timestamp = uint64(time.Now().UnixMicro())
 	}
 	if c.Crypt != nil {
-		resp.Good = c.Crypt.Good
-		resp.Late = c.Crypt.Late
-		resp.Lost = c.Crypt.Lost
-		resp.Resync = c.Crypt.Resync
+		resp.Good, resp.Late, resp.Lost, resp.Resync = c.Crypt.Stats()
 	}
 	_ = c.WriteMessage(protocol.MessagePing, &resp)
 }

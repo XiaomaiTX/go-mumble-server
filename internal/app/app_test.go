@@ -2,10 +2,19 @@ package app
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"errors"
+	"math/big"
 	"net"
+	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/dchote/go-mumble-server/internal/cluster"
 	"github.com/dchote/go-mumble-server/internal/config"
@@ -41,7 +50,32 @@ func modeConfig(t *testing.T, mode config.RuntimeMode) *config.Config {
 	cfg.DatabasePath = filepath.Join(t.TempDir(), "app-test.sqlite")
 	cfg.CoreAddress = "127.0.0.1:64740"
 	cfg.EdgeID = "app-test-edge"
+	if mode == config.ModeEdge {
+		cfg.CoreCACertPath, cfg.EdgeClientCertPath, cfg.EdgeClientKeyPath = edgeTestIdentity(t)
+	}
 	return cfg
+}
+
+func edgeTestIdentity(t *testing.T) (string, string, string) {
+	t.Helper()
+	dir := t.TempDir()
+	now := time.Now()
+	caKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	caT := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "test-ca"}, NotBefore: now.Add(-time.Hour), NotAfter: now.Add(time.Hour), IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign}
+	caDER, _ := x509.CreateCertificate(rand.Reader, caT, caT, &caKey.PublicKey, caKey)
+	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	leaf := &x509.Certificate{SerialNumber: big.NewInt(2), Subject: pkix.Name{CommonName: "app-test-edge"}, NotBefore: now.Add(-time.Hour), NotAfter: now.Add(time.Hour), KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}}
+	leafDER, _ := x509.CreateCertificate(rand.Reader, leaf, caT, &key.PublicKey, caKey)
+	keyDER, _ := x509.MarshalECPrivateKey(key)
+	caPath := filepath.Join(dir, "ca.crt")
+	certPath := filepath.Join(dir, "edge.crt")
+	keyPath := filepath.Join(dir, "edge.key")
+	for path, data := range map[string][]byte{caPath: pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER}), certPath: pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: leafDER}), keyPath: pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})} {
+		if err := os.WriteFile(path, data, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return caPath, certPath, keyPath
 }
 
 func build(t *testing.T, mode config.RuntimeMode) *App {

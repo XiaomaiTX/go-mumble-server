@@ -9,6 +9,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"sync"
 
 	"github.com/dchote/go-mumble-server/pkg/mumble/crypto/ocb2"
 )
@@ -42,6 +43,7 @@ var (
 
 // CryptState handles AEAD encryption/decryption of UDP voice packets.
 type CryptState struct {
+	mu   sync.Mutex
 	mode Mode
 
 	// Legacy (OCB2-AES128)
@@ -73,8 +75,16 @@ func (c *CryptState) Mode() Mode {
 	return c.mode
 }
 
+func (c *CryptState) Stats() (good, late, lost, resync uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.Good, c.Late, c.Lost, c.Resync
+}
+
 // EncNonce returns a copy of the encryption nonce (for CryptSetup resync response).
 func (c *CryptState) EncNonce() []byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.mode == ModeLite {
 		return nil
 	}
@@ -88,6 +98,8 @@ func (c *CryptState) EncNonce() []byte {
 
 // SetDecNonce updates the decryption nonce (when client sends ClientNonce during resync).
 func (c *CryptState) SetDecNonce(nonce []byte) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.mode == ModeLite {
 		return nil
 	}
@@ -103,6 +115,8 @@ func (c *CryptState) SetDecNonce(nonce []byte) error {
 
 // SetKey configures the key and nonces (from CryptSetup message).
 func (c *CryptState) SetKey(key, encNonce, decNonce []byte) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.mode == ModeLite {
 		return nil // lite mode uses no key
 	}
@@ -174,6 +188,8 @@ func (c *CryptState) Overhead() int {
 
 // Encrypt encrypts src into dst. Dst must have length len(src)+Overhead().
 func (c *CryptState) Encrypt(dst, src []byte) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.mode == ModeLite {
 		copy(dst, src)
 		return nil
@@ -186,6 +202,8 @@ func (c *CryptState) Encrypt(dst, src []byte) error {
 
 // Decrypt decrypts src into dst. Returns error on failure.
 func (c *CryptState) Decrypt(dst, src []byte) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.mode == ModeLite {
 		copy(dst, src)
 		return nil

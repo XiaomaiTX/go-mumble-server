@@ -64,6 +64,32 @@ func (r *Registry) EdgeRegistered(id EdgeID) bool {
 	return ok
 }
 
+// EdgeGeneration returns the currently registered incarnation of an edge.
+func (r *Registry) EdgeGeneration(id EdgeID) (uint64, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	g, ok := r.edges[id]
+	return g, ok
+}
+
+// SessionsForEdge returns only sessions owned by the exact edge incarnation.
+// Callers use the generation check to ensure a delayed disconnect from an old
+// socket cannot clean up sessions belonging to a replacement connection.
+func (r *Registry) SessionsForEdge(instance EdgeInstanceRef) []SessionRef {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if current, ok := r.edges[instance.EdgeID]; !ok || current != instance.Generation {
+		return nil
+	}
+	refs := make([]SessionRef, 0)
+	for _, e := range r.sessions {
+		if e.edge == instance.EdgeID {
+			refs = append(refs, e.ref)
+		}
+	}
+	return refs
+}
+
 func (r *Registry) Bind(ref SessionRef, edge EdgeID) error {
 	if !ref.Valid() {
 		return ErrInvalidSession

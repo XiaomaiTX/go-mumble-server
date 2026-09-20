@@ -69,13 +69,23 @@ func main() {
 		done <- application.Run(ctx)
 	}()
 
-	<-waitForShutdown()
+	select {
+	case <-waitForShutdown():
+	case err = <-done:
+		if err != nil {
+			slog.Error("server exit", "err", err)
+		}
+	}
 	cancel()
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
 	_ = application.Shutdown(shutdownCtx)
-	if err := <-done; err != nil {
-		slog.Error("server exit", "err", err)
+	select {
+	case err = <-done:
+		if err != nil {
+			slog.Error("server exit", "err", err)
+		}
+	default:
 	}
 }
 

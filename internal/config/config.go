@@ -31,14 +31,14 @@ func ParseRuntimeMode(value string) (RuntimeMode, error) {
 
 // Config holds the server configuration.
 type Config struct {
-	Mode           RuntimeMode
-	Host           string
-	MumblePort     int
-	RESTPort       int
-	FrontendEmbed  bool
-	DatabasePath   string
-	SSLCertPath    string
-	SSLKeyPath     string
+	Mode          RuntimeMode
+	Host          string
+	MumblePort    int
+	RESTPort      int
+	FrontendEmbed bool
+	DatabasePath  string
+	SSLCertPath   string
+	SSLKeyPath    string
 	// EdgeListenAddr is the core-mode listener address reserved for the future
 	// Remote Edge server ([distributed].edge_listen). Optional: the wire
 	// protocol is not implemented yet, so an empty value keeps the capability
@@ -52,22 +52,33 @@ type Config struct {
 	EdgeID string
 	// CoreCACertPath is the future Core trust anchor for edge-core mTLS
 	// ([distributed].core_ca_cert). Optional skeleton entry point.
-	CoreCACertPath string
-	MaxUsers       int
-	MaxBandwidth   int
-	LogLevel       string
-	JWTIssuer      string
-	JWTAudience    string
-	JWTExpiryDays  int
-	ChannelDepth   int
-	ChannelCount   int
-	WelcomeText    string
-	ServerPassword string
-	DefaultChannel int
-	CertRequired   bool
-	Bonjour        bool
-	RegisterName   string
-	VoiceDebug     bool
+	CoreCACertPath        string
+	EdgeTLSCertPath       string
+	EdgeTLSKeyPath        string
+	EdgeClientCAPath      string
+	EdgeClientCertPath    string
+	EdgeClientKeyPath     string
+	CoreServerName        string
+	EdgeHeartbeatInterval time.Duration
+	EdgeHeartbeatTimeout  time.Duration
+	EdgeReconnectMin      time.Duration
+	EdgeReconnectMax      time.Duration
+	EdgeQueueSize         int
+	MaxUsers              int
+	MaxBandwidth          int
+	LogLevel              string
+	JWTIssuer             string
+	JWTAudience           string
+	JWTExpiryDays         int
+	ChannelDepth          int
+	ChannelCount          int
+	WelcomeText           string
+	ServerPassword        string
+	DefaultChannel        int
+	CertRequired          bool
+	Bonjour               bool
+	RegisterName          string
+	VoiceDebug            bool
 	// AllowRecording mirrors murmur's allowRecording: when false a client that
 	// announces it started recording is disconnected instead of being relayed.
 	AllowRecording bool
@@ -99,11 +110,22 @@ type Config struct {
 // fileConfig mirrors the TOML structure for parsing.
 type fileConfig struct {
 	Distributed struct {
-		Mode        string `toml:"mode"`
-		EdgeListen  string `toml:"edge_listen"`
-		CoreAddress string `toml:"core_address"`
-		EdgeID      string `toml:"edge_id"`
-		CoreCACert  string `toml:"core_ca_cert"`
+		Mode                     string `toml:"mode"`
+		EdgeListen               string `toml:"edge_listen"`
+		CoreAddress              string `toml:"core_address"`
+		EdgeID                   string `toml:"edge_id"`
+		CoreCACert               string `toml:"core_ca_cert"`
+		EdgeTLSCert              string `toml:"edge_tls_cert"`
+		EdgeTLSKey               string `toml:"edge_tls_key"`
+		EdgeClientCA             string `toml:"edge_client_ca"`
+		ClientCert               string `toml:"client_cert"`
+		ClientKey                string `toml:"client_key"`
+		CoreServerName           string `toml:"core_server_name"`
+		HeartbeatIntervalSeconds int    `toml:"heartbeat_interval_seconds"`
+		HeartbeatTimeoutSeconds  int    `toml:"heartbeat_timeout_seconds"`
+		ReconnectMinMS           int    `toml:"reconnect_min_ms"`
+		ReconnectMaxMS           int    `toml:"reconnect_max_ms"`
+		QueueSize                int    `toml:"queue_size"`
 	} `toml:"distributed"`
 	Network struct {
 		Port     int    `toml:"port"`
@@ -186,6 +208,11 @@ func defaults() *Config {
 		ExternalAuthTimeout:          1500 * time.Millisecond,
 		ExternalAuthRevalidate:       45 * time.Second,
 		ExternalAuthStaleGrace:       3 * time.Minute,
+		EdgeHeartbeatInterval:        5 * time.Second,
+		EdgeHeartbeatTimeout:         15 * time.Second,
+		EdgeReconnectMin:             250 * time.Millisecond,
+		EdgeReconnectMax:             5 * time.Second,
+		EdgeQueueSize:                256,
 	}
 }
 
@@ -228,6 +255,27 @@ func applyFileConfig(cfg *Config, fc *fileConfig) {
 	}
 	if fc.Distributed.CoreCACert != "" {
 		cfg.CoreCACertPath = fc.Distributed.CoreCACert
+	}
+	cfg.EdgeTLSCertPath = fc.Distributed.EdgeTLSCert
+	cfg.EdgeTLSKeyPath = fc.Distributed.EdgeTLSKey
+	cfg.EdgeClientCAPath = fc.Distributed.EdgeClientCA
+	cfg.EdgeClientCertPath = fc.Distributed.ClientCert
+	cfg.EdgeClientKeyPath = fc.Distributed.ClientKey
+	cfg.CoreServerName = fc.Distributed.CoreServerName
+	if fc.Distributed.HeartbeatIntervalSeconds > 0 {
+		cfg.EdgeHeartbeatInterval = time.Duration(fc.Distributed.HeartbeatIntervalSeconds) * time.Second
+	}
+	if fc.Distributed.HeartbeatTimeoutSeconds > 0 {
+		cfg.EdgeHeartbeatTimeout = time.Duration(fc.Distributed.HeartbeatTimeoutSeconds) * time.Second
+	}
+	if fc.Distributed.ReconnectMinMS > 0 {
+		cfg.EdgeReconnectMin = time.Duration(fc.Distributed.ReconnectMinMS) * time.Millisecond
+	}
+	if fc.Distributed.ReconnectMaxMS > 0 {
+		cfg.EdgeReconnectMax = time.Duration(fc.Distributed.ReconnectMaxMS) * time.Millisecond
+	}
+	if fc.Distributed.QueueSize > 0 {
+		cfg.EdgeQueueSize = fc.Distributed.QueueSize
 	}
 	if fc.Network.Host != "" {
 		cfg.Host = fc.Network.Host
@@ -320,6 +368,49 @@ func applyEnv(cfg *Config) {
 	}
 	if v := os.Getenv("MUMBLE_CORE_CA_CERT"); v != "" {
 		cfg.CoreCACertPath = v
+	}
+	if v := os.Getenv("MUMBLE_EDGE_TLS_CERT"); v != "" {
+		cfg.EdgeTLSCertPath = v
+	}
+	if v := os.Getenv("MUMBLE_EDGE_TLS_KEY"); v != "" {
+		cfg.EdgeTLSKeyPath = v
+	}
+	if v := os.Getenv("MUMBLE_EDGE_CLIENT_CA"); v != "" {
+		cfg.EdgeClientCAPath = v
+	}
+	if v := os.Getenv("MUMBLE_EDGE_CLIENT_CERT"); v != "" {
+		cfg.EdgeClientCertPath = v
+	}
+	if v := os.Getenv("MUMBLE_EDGE_CLIENT_KEY"); v != "" {
+		cfg.EdgeClientKeyPath = v
+	}
+	if v := os.Getenv("MUMBLE_CORE_SERVER_NAME"); v != "" {
+		cfg.CoreServerName = v
+	}
+	if v := os.Getenv("MUMBLE_EDGE_HEARTBEAT_INTERVAL_SECONDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.EdgeHeartbeatInterval = time.Duration(n) * time.Second
+		}
+	}
+	if v := os.Getenv("MUMBLE_EDGE_HEARTBEAT_TIMEOUT_SECONDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.EdgeHeartbeatTimeout = time.Duration(n) * time.Second
+		}
+	}
+	if v := os.Getenv("MUMBLE_EDGE_RECONNECT_MIN_MS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.EdgeReconnectMin = time.Duration(n) * time.Millisecond
+		}
+	}
+	if v := os.Getenv("MUMBLE_EDGE_RECONNECT_MAX_MS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.EdgeReconnectMax = time.Duration(n) * time.Millisecond
+		}
+	}
+	if v := os.Getenv("MUMBLE_EDGE_QUEUE_SIZE"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.EdgeQueueSize = n
+		}
 	}
 	if v := os.Getenv("MUMBLE_HOST"); v != "" {
 		cfg.Host = v
@@ -471,6 +562,17 @@ func ValidateForMode(cfg *Config) error {
 			if _, _, err := net.SplitHostPort(cfg.EdgeListenAddr); err != nil {
 				return fmt.Errorf("distributed.edge_listen = %q is not host:port", cfg.EdgeListenAddr)
 			}
+			if err := validateCertPair(cfg.EdgeTLSCertPath, cfg.EdgeTLSKeyPath); err != nil {
+				return fmt.Errorf("distributed edge TLS: %w", err)
+			}
+			if cfg.EdgeTLSCertPath == "" || cfg.EdgeClientCAPath == "" {
+				return fmt.Errorf("mode %q with edge_listen requires edge_tls_cert, edge_tls_key and edge_client_ca", cfg.Mode)
+			}
+			for name, path := range map[string]string{"edge_tls_cert": cfg.EdgeTLSCertPath, "edge_tls_key": cfg.EdgeTLSKeyPath, "edge_client_ca": cfg.EdgeClientCAPath} {
+				if _, err := os.Stat(path); err != nil {
+					return fmt.Errorf("distributed.%s %q unreadable: %w", name, path, err)
+				}
+			}
 		}
 		return nil
 	case ModeEdge:
@@ -490,6 +592,20 @@ func ValidateForMode(cfg *Config) error {
 			if _, err := os.Stat(cfg.CoreCACertPath); err != nil {
 				return fmt.Errorf("distributed.core_ca_cert %q unreadable: %w", cfg.CoreCACertPath, err)
 			}
+		}
+		if err := validateCertPair(cfg.EdgeClientCertPath, cfg.EdgeClientKeyPath); err != nil {
+			return fmt.Errorf("distributed client TLS: %w", err)
+		}
+		if cfg.CoreCACertPath == "" || cfg.EdgeClientCertPath == "" {
+			return fmt.Errorf("mode %q requires core_ca_cert, client_cert and client_key", cfg.Mode)
+		}
+		for name, path := range map[string]string{"client_cert": cfg.EdgeClientCertPath, "client_key": cfg.EdgeClientKeyPath} {
+			if _, err := os.Stat(path); err != nil {
+				return fmt.Errorf("distributed.%s %q unreadable: %w", name, path, err)
+			}
+		}
+		if cfg.EdgeHeartbeatTimeout <= cfg.EdgeHeartbeatInterval {
+			return fmt.Errorf("heartbeat_timeout must exceed heartbeat_interval")
 		}
 		return nil
 	default:

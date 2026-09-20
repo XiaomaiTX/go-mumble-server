@@ -300,7 +300,11 @@ func (s *Server) SendVoice(sender cluster.SessionRef, frame mumbleaudio.Frame, r
 			target, targetOK := s.users.Snapshot(recipient.SessionID)
 			hasPosition = speakerOK && targetOK && bytes.Equal(speaker.PluginContext, target.PluginContext)
 		}
-		batch.Recipients = append(batch.Recipients, cluster.VoiceRecipient{Session: ref, Context: d.Context, Volume: d.VolumeAdjustment, HasPosition: hasPosition})
+		forceTunnel := false
+		if target, ok := s.users.Snapshot(recipient.SessionID); ok {
+			forceTunnel = s.channelHasMixedCrypto(target.ChannelID)
+		}
+		batch.Recipients = append(batch.Recipients, cluster.VoiceRecipient{Session: ref, Context: d.Context, Volume: d.VolumeAdjustment, HasPosition: hasPosition, ForceTunnel: forceTunnel})
 	}
 	s.dispatcher.DispatchVoice(context.Background(), batch)
 	return nil

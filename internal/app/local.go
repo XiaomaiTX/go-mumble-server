@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"io/fs"
 
@@ -9,6 +10,7 @@ import (
 	"github.com/dchote/go-mumble-server/internal/config"
 	"github.com/dchote/go-mumble-server/internal/database"
 	"github.com/dchote/go-mumble-server/internal/server"
+	"golang.org/x/sync/errgroup"
 )
 
 // buildLocalRuntime composes standalone and core: one process hosting the
@@ -32,7 +34,14 @@ func buildLocalRuntime(ctx context.Context, cfg *config.Config, feFS fs.FS) (*Ap
 		ClientRuntime: srv.ClientRuntime(),
 	}
 	if cfg.Mode == config.ModeCore {
-		a.RemoteEdge = cluster.NewRemoteEdgeServer(srv.Mumble().Registry(), cfg.EdgeListenAddr)
+		var tlsConfig *tls.Config
+		if cfg.EdgeListenAddr != "" {
+			tlsConfig, err = coreEdgeTLS(cfg)
+			if err != nil {
+				return nil, err
+			}
+		}
+		a.RemoteEdge = cluster.NewRemoteEdgeServerWithConfig(srv.Mumble().Registry(), srv.Mumble(), cluster.RemoteEdgeServerConfig{ListenAddr: cfg.EdgeListenAddr, TLSConfig: tlsConfig, HeartbeatInterval: cfg.EdgeHeartbeatInterval, HeartbeatTimeout: cfg.EdgeHeartbeatTimeout, QueueSize: cfg.EdgeQueueSize})
 		a.runtime = &coreRuntime{srv: srv, remoteEdge: a.RemoteEdge}
 		return a, nil
 	}
@@ -48,11 +57,17 @@ type coreRuntime struct {
 }
 
 func (c *coreRuntime) Run(ctx context.Context) error {
-	if err := c.remoteEdge.Start(ctx); err != nil {
-		return fmt.Errorf("start remote edge server: %w", err)
-	}
-	defer c.remoteEdge.Close()
-	return c.srv.Run(ctx)
+	g, gctx := errgroup.WithContext(ctx)
+	g.Go(func() error {
+		if err := c.remoteEdge.Start(gctx); err != nil {
+			return fmt.Errorf("start remote edge server: %w", err)
+		}
+		return nil
+	})
+	g.Go(func() error { return c.srv.Run(gctx) })
+	err := g.Wait()
+	_ = c.remoteEdge.Close()
+	return err
 }
 
 func (c *coreRuntime) Shutdown(ctx context.Context) error {

@@ -31,6 +31,7 @@ type VoiceRecipient struct {
 	Context     mumbleaudio.Context
 	Volume      float32
 	HasPosition bool
+	ForceTunnel bool
 }
 
 type VoiceBatch struct {

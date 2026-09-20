@@ -115,6 +115,17 @@ func TestParseRuntimeMode(t *testing.T) {
 }
 
 func TestValidateForMode(t *testing.T) {
+	files := func(names ...string) []string {
+		dir := t.TempDir()
+		out := make([]string, len(names))
+		for i, name := range names {
+			out[i] = filepath.Join(dir, name)
+			if err := os.WriteFile(out[i], []byte("test"), 0600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return out
+	}
 	base := func(mutate func(*Config)) *Config {
 		t.Helper()
 		cfg, err := Load("")
@@ -141,6 +152,10 @@ func TestValidateForMode(t *testing.T) {
 		{"core valid edge listen", base(func(c *Config) {
 			c.Mode = ModeCore
 			c.EdgeListenAddr = "127.0.0.1:64740"
+			p := files("server.crt", "server.key", "clients.crt")
+			c.EdgeTLSCertPath = p[0]
+			c.EdgeTLSKeyPath = p[1]
+			c.EdgeClientCAPath = p[2]
 		}), ""},
 		{"edge missing core address", base(func(c *Config) { c.Mode = ModeEdge }), "core_address"},
 		{"edge bad core address", base(func(c *Config) {
@@ -156,6 +171,10 @@ func TestValidateForMode(t *testing.T) {
 			c.Mode = ModeEdge
 			c.CoreAddress = "127.0.0.1:64740"
 			c.EdgeID = "edge-1"
+			p := files("core-ca.crt", "edge.crt", "edge.key")
+			c.CoreCACertPath = p[0]
+			c.EdgeClientCertPath = p[1]
+			c.EdgeClientKeyPath = p[2]
 		}), ""},
 		{"edge unreadable core ca", base(func(c *Config) {
 			c.Mode = ModeEdge
