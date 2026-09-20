@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -96,5 +97,86 @@ func TestLoad_NonexistentFile(t *testing.T) {
 	_, err := Load("/nonexistent/mumble-server.toml")
 	if err == nil {
 		t.Fatal("Load expected error for nonexistent file")
+	}
+}
+
+func TestParseRuntimeMode(t *testing.T) {
+	for _, s := range []string{"standalone", "core", "edge"} {
+		m, err := ParseRuntimeMode(s)
+		if err != nil {
+			t.Errorf("ParseRuntimeMode(%q): %v", s, err)
+		} else if string(m) != s {
+			t.Errorf("ParseRuntimeMode(%q) = %q", s, m)
+		}
+	}
+	if _, err := ParseRuntimeMode("cluster"); err == nil {
+		t.Error("ParseRuntimeMode accepted an unknown mode")
+	}
+}
+
+func TestValidateForMode(t *testing.T) {
+	base := func(mutate func(*Config)) *Config {
+		t.Helper()
+		cfg, err := Load("")
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		cfg.Mode = ModeStandalone
+		mutate(cfg)
+		return cfg
+	}
+	cases := []struct {
+		name    string
+		cfg     *Config
+		wantErr string
+	}{
+		{"standalone defaults", base(func(*Config) {}), ""},
+		{"standalone missing database", base(func(c *Config) { c.DatabasePath = "" }), "database path"},
+		{"standalone half cert pair", base(func(c *Config) { c.SSLCertPath = "a.crt" }), "together"},
+		{"core defaults", base(func(c *Config) { c.Mode = ModeCore }), ""},
+		{"core bad edge listen", base(func(c *Config) {
+			c.Mode = ModeCore
+			c.EdgeListenAddr = "no-port"
+		}), "host:port"},
+		{"core valid edge listen", base(func(c *Config) {
+			c.Mode = ModeCore
+			c.EdgeListenAddr = "127.0.0.1:64740"
+		}), ""},
+		{"edge missing core address", base(func(c *Config) { c.Mode = ModeEdge }), "core_address"},
+		{"edge bad core address", base(func(c *Config) {
+			c.Mode = ModeEdge
+			c.CoreAddress = "no-port"
+			c.EdgeID = "edge-1"
+		}), "host:port"},
+		{"edge missing edge id", base(func(c *Config) {
+			c.Mode = ModeEdge
+			c.CoreAddress = "127.0.0.1:64740"
+		}), "edge_id"},
+		{"edge valid", base(func(c *Config) {
+			c.Mode = ModeEdge
+			c.CoreAddress = "127.0.0.1:64740"
+			c.EdgeID = "edge-1"
+		}), ""},
+		{"edge unreadable core ca", base(func(c *Config) {
+			c.Mode = ModeEdge
+			c.CoreAddress = "127.0.0.1:64740"
+			c.EdgeID = "edge-1"
+			c.CoreCACertPath = filepath.Join(t.TempDir(), "missing-ca.crt")
+		}), "core_ca_cert"},
+		{"unknown mode", base(func(c *Config) { c.Mode = RuntimeMode("bogus") }), "unsupported runtime mode"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidateForMode(tc.cfg)
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("ValidateForMode: unexpected error %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("ValidateForMode error = %v, want containing %q", err, tc.wantErr)
+			}
+		})
 	}
 }

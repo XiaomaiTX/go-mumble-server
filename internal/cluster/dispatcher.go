@@ -34,6 +34,14 @@ func (d *Dispatcher) RegisterVoiceTransport(edge EdgeID, transport VoiceTranspor
 	d.voice[edge] = transport
 }
 
+// VoiceTransportFor reports the registered voice transport for an edge.
+// Read-only composition introspection; it changes no dispatch state.
+func (d *Dispatcher) VoiceTransportFor(edge EdgeID) VoiceTransport {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.voice[edge]
+}
+
 func (d *Dispatcher) DispatchVoice(ctx context.Context, batch VoiceBatch) {
 	if !d.registry.Active(batch.Sender) {
 		return

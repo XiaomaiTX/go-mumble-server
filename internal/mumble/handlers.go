@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/tls"
-	"encoding/binary"
 	"fmt"
 	"log/slog"
 	"net"
@@ -22,6 +21,7 @@ import (
 	"github.com/dchote/go-mumble-server/internal/cluster"
 	"github.com/dchote/go-mumble-server/internal/config"
 	"github.com/dchote/go-mumble-server/internal/connection"
+	"github.com/dchote/go-mumble-server/internal/edge"
 	"github.com/dchote/go-mumble-server/internal/identity"
 	"github.com/dchote/go-mumble-server/internal/user"
 	"github.com/dchote/go-mumble-server/pkg/mumble"
@@ -41,6 +41,8 @@ type Server struct {
 	bans            *ban.Manager
 	acl             *acl.Evaluator
 	table           protocol.HandlerTable
+	edgeIngress     protocol.HandlerTable
+	coreIngress     protocol.HandlerTable
 	connMu          sync.RWMutex
 	conns           map[uint32]*connection.Conn
 	addrBySession   sync.Map // SessionRef -> net.Addr
@@ -102,7 +104,7 @@ func (s *Server) HandleUDP(addr net.Addr, data []byte) {
 	// Unencrypted server-list probes are answered before any crypt handling, like
 	// Murmur's Server::udpActivated. Senders here have no session, so falling
 	// through to the trial-decrypt path would only log noise and drop the probe.
-	if reply := s.plainPingReply(data); reply != nil {
+	if reply := edge.PlainPingReply(data, s.users.Count(), s.cfg.MaxUsers, s.cfg.MaxBandwidth); reply != nil {
 		s.udpConn.WriteTo(reply, addr)
 		return
 	}
@@ -237,9 +239,9 @@ func (s *Server) HandleUDP(addr net.Addr, data []byte) {
 		}
 		if mode == mumbleaudio.WireProtobuf {
 			if extended {
-				plain = s.protobufPingReply(plain[1:])
+				plain = edge.ProtobufPingReply(plain[1:], s.users.Count(), s.cfg.MaxUsers, s.cfg.MaxBandwidth)
 			} else {
-				plain = appendProtoVarintField([]byte{1}, 1, timestamp)
+				plain = edge.AppendProtoVarintField([]byte{1}, 1, timestamp)
 			}
 		}
 		cid, ok := s.users.ChannelID(senderSession)
@@ -272,95 +274,11 @@ func (s *Server) HandleUDP(addr net.Addr, data []byte) {
 }
 
 // Audio 双格式实现已接入，控制通道默认宣告 1.5.0。
-// 该版本宣告与连接级 WireMode 使用同一协议能力基线。
-const ServerVersionV2 = uint64(1<<48 | 5<<32)
+// 该版本宣告与连接级 WireMode 使用同一协议能力基线；单一来源在
+// internal/edge，Local Edge 与 Remote Edge 共用同一宣告。
+const ServerVersionV2 = edge.ProtocolVersionV2
 
-const ServerVersionV1 = uint32(1<<16 | 5<<8) // 1.5.0 as (major<<16)|(minor<<8)|patch
-
-// Version reported in server-list ping replies. This is a display field for
-// public-server listings, separate from the authenticated Version exchange.
-// The legacy ping format cannot express v2 versions, so both fields carry the
-// same 1.5.0 value in their respective encodings.
-const (
-	pingLegacyVersion  = uint32(1<<16 | 5<<8)  // 1.5.0 as (major<<16)|(minor<<8)|patch
-	pingVersionV2      = uint64(1<<48 | 5<<32) // 1.5.0 as major<<48|minor<<32|patch<<16
-	pingHeaderProtobuf = byte(0x01)            // UDPMessageType::Ping, new (1.5+) format
-)
-
-// plainPingReply builds the reply for an unencrypted server-list probe, or returns
-// nil when data is not an extended-information probe. Murmur only answers probes
-// that request extended information (expectExtended); plain echo pings from
-// unknown senders get nothing, which keeps the socket from being a reflection
-// amplifier.
-func (s *Server) plainPingReply(data []byte) []byte {
-	// Legacy (≤1.4) probe: 12 bytes, no header, leading u32 zero.
-	if len(data) == 12 && binary.BigEndian.Uint32(data[0:4]) == 0 {
-		out := make([]byte, 24)
-		binary.BigEndian.PutUint32(out[0:4], pingLegacyVersion)
-		copy(out[4:12], data[4:12]) // timestamp is opaque, echo request bytes verbatim
-		binary.BigEndian.PutUint32(out[12:16], uint32(s.users.Count()))
-		binary.BigEndian.PutUint32(out[16:20], uint32(s.cfg.MaxUsers))
-		binary.BigEndian.PutUint32(out[20:24], uint32(s.cfg.MaxBandwidth))
-		return out
-	}
-	// New (1.5+) probe: header byte plus protobuf MumbleUDP.Ping.
-	if len(data) > 1 && data[0] == pingHeaderProtobuf {
-		return s.protobufPingReply(data[1:])
-	}
-	return nil
-}
-
-// protobufPingReply answers a 1.5+ probe encoded as MumbleUDP.Ping. Only the
-// varint fields of Ping are inspected (timestamp=1, request_extended_information=2);
-// the reply echoes the timestamp and fills server_version_v2=3, user_count=4,
-// max_user_count=5, max_bandwidth_per_user=6.
-func (s *Server) protobufPingReply(body []byte) []byte {
-	timestamp, requestInfo, err := mumbleaudio.DecodePing(mumbleaudio.WireProtobuf, append([]byte{1}, body...))
-	if err != nil {
-		return nil
-	}
-	if !requestInfo {
-		return nil
-	}
-	out := make([]byte, 1, 32)
-	out[0] = pingHeaderProtobuf
-	out = appendProtoVarintField(out, 1, timestamp)
-	out = appendProtoVarintField(out, 3, pingVersionV2)
-	out = appendProtoVarintField(out, 4, uint64(s.users.Count()))
-	out = appendProtoVarintField(out, 5, uint64(s.cfg.MaxUsers))
-	out = appendProtoVarintField(out, 6, uint64(s.cfg.MaxBandwidth))
-	return out
-}
-
-// decodeProtoVarint decodes a protobuf base-128 varint, returning its value and
-// the number of bytes consumed, or -1 when the input is truncated or overlong.
-func decodeProtoVarint(b []byte) (uint64, int) {
-	var v uint64
-	for i := 0; i < len(b) && i < 10; i++ {
-		if i == 9 && b[i] > 1 {
-			return 0, -1
-		}
-		v |= uint64(b[i]&0x7f) << (7 * i)
-		if b[i]&0x80 == 0 {
-			return v, i + 1
-		}
-	}
-	return 0, -1
-}
-
-func appendProtoVarintField(buf []byte, field uint64, v uint64) []byte {
-	buf = appendProtoVarint(buf, field<<3) // wire type 0 (varint)
-	buf = appendProtoVarint(buf, v)
-	return buf
-}
-
-func appendProtoVarint(buf []byte, v uint64) []byte {
-	for v >= 0x80 {
-		buf = append(buf, byte(v)|0x80)
-		v >>= 7
-	}
-	return append(buf, byte(v))
-}
+const ServerVersionV1 = edge.ProtocolVersionV1 // 1.5.0 as (major<<16)|(minor<<8)|patch
 
 // SendVoice is the common canonical-recipient handoff used by normal voice,
 // VoiceTarget, listeners and loopback.
@@ -634,39 +552,90 @@ func NewServer(cfg *config.Config, db *gorm.DB, serverID uint, udpConn net.Packe
 	return s
 }
 
-func (s *Server) registerHandlers() {
-	// Local Edge entries: version/wire-mode negotiation, authentication (runs
-	// the CryptSetup handshake) and UDP tunnel audio decode keep the raw
-	// *connection.Conn because they are edge-local by protocol ownership.
-	s.table[protocol.MessageVersion] = s.handleVersion
-	s.table[protocol.MessageAuthenticate] = s.handleAuthenticate
-	// Ping terminates at the Local Edge (connection.Conn) and never reaches
-	// this table; only the TCP latency metric is reported to Core.
-	s.table[protocol.MessageCryptSetup] = s.handleCryptSetup
-	s.table[protocol.MessageUDPTunnel] = s.handleUDPTunnel
-	// Core control handlers go through the typed Peer adapter.
-	s.table[protocol.MessageUserRemove] = s.peerAdapt(s.handleUserRemove)
-	s.table[protocol.MessageUserState] = s.peerAdapt(s.handleUserState)
-	s.table[protocol.MessageChannelState] = s.peerAdapt(s.handleChannelState)
-	s.table[protocol.MessageChannelRemove] = s.peerAdapt(s.handleChannelRemove)
-	s.table[protocol.MessageTextMessage] = s.peerAdapt(s.handleTextMessage)
-	s.table[protocol.MessageVoiceTarget] = s.peerAdapt(s.handleVoiceTarget)
-	s.table[protocol.MessageBanList] = s.peerAdapt(s.handleBanList)
-	s.table[protocol.MessageACL] = s.peerAdapt(s.handleACL)
-	s.table[protocol.MessagePermissionQuery] = s.peerAdapt(s.handlePermissionQuery)
-	s.table[protocol.MessageRequestBlob] = s.peerAdapt(s.handleRequestBlob)
-	s.table[protocol.MessageUserStats] = s.peerAdapt(s.handleUserStats)
-	s.table[protocol.MessageQueryUsers] = s.peerAdapt(s.handleQueryUsers)
-	s.table[protocol.MessageUserList] = s.handleUserList
-	s.table[protocol.MessageContextActionModify] = s.handleContextActionModify
-	s.table[protocol.MessageContextAction] = s.handleContextAction
-	s.table[protocol.MessagePluginDataTransmission] = s.handlePluginDataTransmission
+// SetUDPConn binds the UDP socket the edge-local UDP ingress writes replies
+// through. The shared client runtime owns the socket; this is called once
+// during composition, before Run admits any traffic.
+func (s *Server) SetUDPConn(conn net.PacketConn) {
+	s.udpConn = conn
 }
 
-// HandlerTable returns the handler table.
+func (s *Server) registerHandlers() {
+	s.edgeIngress = protocol.NewHandlerTable()
+	s.coreIngress = protocol.NewHandlerTable()
+	// register mirrors one registration into the ownership split and the
+	// legacy union table so HandlerTable consumers keep their behavior.
+	register := func(ownership edge.MessageOwnership, msgType protocol.MessageType, h protocol.MessageHandler) {
+		s.table[msgType] = h
+		if ownership == edge.OwnershipCore {
+			s.coreIngress[msgType] = h
+		} else {
+			s.edgeIngress[msgType] = h
+		}
+	}
+	// Local Edge entries: version/wire-mode negotiation, authentication (runs
+	// the CryptSetup handshake) and UDP tunnel audio decode keep the raw
+	// *connection.Conn because they are edge-local by protocol ownership. The
+	// fused split-owned halves (Version metadata, Authenticate decision) live
+	// here because the Core is in-process.
+	register(edge.OwnershipSplit, protocol.MessageVersion, s.handleVersion)
+	register(edge.OwnershipSplit, protocol.MessageAuthenticate, s.handleAuthenticate)
+	// Ping terminates at the Local Edge (connection.Conn) and never reaches
+	// this table; only the TCP latency metric is reported to Core.
+	register(edge.OwnershipEdge, protocol.MessageCryptSetup, s.handleCryptSetup)
+	register(edge.OwnershipSplit, protocol.MessageUDPTunnel, s.handleUDPTunnel)
+	// Core control handlers go through the typed Peer adapter.
+	register(edge.OwnershipCore, protocol.MessageUserRemove, s.peerAdapt(s.handleUserRemove))
+	register(edge.OwnershipCore, protocol.MessageUserState, s.peerAdapt(s.handleUserState))
+	register(edge.OwnershipCore, protocol.MessageChannelState, s.peerAdapt(s.handleChannelState))
+	register(edge.OwnershipCore, protocol.MessageChannelRemove, s.peerAdapt(s.handleChannelRemove))
+	register(edge.OwnershipCore, protocol.MessageTextMessage, s.peerAdapt(s.handleTextMessage))
+	register(edge.OwnershipCore, protocol.MessageVoiceTarget, s.peerAdapt(s.handleVoiceTarget))
+	register(edge.OwnershipCore, protocol.MessageBanList, s.peerAdapt(s.handleBanList))
+	register(edge.OwnershipCore, protocol.MessageACL, s.peerAdapt(s.handleACL))
+	register(edge.OwnershipCore, protocol.MessagePermissionQuery, s.peerAdapt(s.handlePermissionQuery))
+	register(edge.OwnershipCore, protocol.MessageRequestBlob, s.peerAdapt(s.handleRequestBlob))
+	register(edge.OwnershipCore, protocol.MessageUserStats, s.peerAdapt(s.handleUserStats))
+	register(edge.OwnershipCore, protocol.MessageQueryUsers, s.peerAdapt(s.handleQueryUsers))
+	register(edge.OwnershipCore, protocol.MessageUserList, s.handleUserList)
+	register(edge.OwnershipCore, protocol.MessageContextActionModify, s.handleContextActionModify)
+	register(edge.OwnershipCore, protocol.MessageContextAction, s.handleContextAction)
+	register(edge.OwnershipCore, protocol.MessagePluginDataTransmission, s.handlePluginDataTransmission)
+}
+
+// HandlerTable returns the union handler table (Local Edge entries plus Core
+// control entries); the ingress router routes by ownership instead.
 func (s *Server) HandlerTable() protocol.HandlerTable {
 	return s.table
 }
+
+// EdgeIngressHandler returns the Local Edge half of the client ingress
+// boundary: handlers for edge-owned and split-owned messages that operate on
+// the raw *connection.Conn transport state.
+func (s *Server) EdgeIngressHandler() protocol.MessageHandler {
+	return tableHandler(s.edgeIngress)
+}
+
+// CoreIngressHandler returns the Core half of the client ingress boundary:
+// core-owned business messages entered through the typed Peer adapter.
+func (s *Server) CoreIngressHandler() protocol.MessageHandler {
+	return tableHandler(s.coreIngress)
+}
+
+func tableHandler(t protocol.HandlerTable) protocol.MessageHandler {
+	return func(msgType protocol.MessageType, payload []byte, ctx interface{}) error {
+		return t.Dispatch(msgType, payload, ctx)
+	}
+}
+
+// Registry returns the session registry contract; the core-mode Remote Edge
+// server capability registers its edges here.
+func (s *Server) Registry() *cluster.Registry { return s.registry }
+
+// ControlTransport returns the per-session FIFO control transport contract.
+func (s *Server) ControlTransport() *cluster.ControlTransport { return s.control }
+
+// Dispatcher returns the edge-grouped voice dispatcher contract.
+func (s *Server) Dispatcher() *cluster.Dispatcher { return s.dispatcher }
 
 // UserManager returns the user manager.
 // ChanManager returns the channel manager for REST API channel CRUD.
@@ -1086,6 +1055,12 @@ func banEntryByIP(name, reason string, ip net.IP) messages.BanEntry {
 // REST-initiated bans behave identically for sessions without a local conn
 // (remote edge sessions). Cert-hash bans survive IP changes; otherwise the
 // address is banned.
+//
+// TODO(auth metadata): the local-conn fallback below must disappear once
+// every session creation path (edge attestation included) carries
+// RemoteAddress/CertHash/CertificateVerified/ClientVersion metadata; remote
+// sessions already resolve bans purely from stored metadata — pinned by
+// TestRemoteSessionBanRequiresNoSocketFallback.
 func (s *Server) appendSessionBan(existing []messages.BanEntry, u mumble.User, reason string) []messages.BanEntry {
 	var ip net.IP
 	if u.Address != "" {
@@ -1184,20 +1159,10 @@ func (s *Server) handleVersion(msgType protocol.MessageType, payload []byte, ctx
 	return nil
 }
 
-// clientVersionFull resolves a client's Version message to Mumble's packed 64-bit
-// version_v2 form, preferring version_v2 and falling back to the legacy 32-bit
-// version_v1 encoding. Mirrors MumbleProto::getVersion (research/mumble/src/ProtoUtils.cpp).
+// clientVersionFull 委托共享实现（edge.ClientVersionFull），Local/Remote Edge
+// 使用同一解析。
 func clientVersionFull(v messages.Version) uint64 {
-	if v.VersionV2 != 0 {
-		return v.VersionV2
-	}
-	if v.VersionV1 != 0 {
-		major := uint64((v.VersionV1 & 0xFFFF0000) >> 16)
-		minor := uint64((v.VersionV1 & 0xFF00) >> 8)
-		patch := uint64(v.VersionV1 & 0xFF)
-		return major<<48 | minor<<32 | patch<<16
-	}
-	return 0
+	return edge.ClientVersionFull(v)
 }
 
 // handleAuthenticate is a Local Edge entry: it collects the client certificate
@@ -1392,17 +1357,10 @@ func sanitizedClientTokens(tokens []string) []string {
 	return result
 }
 
+// sendReject 交付 Reject 作为连接的最后一条消息并随后关闭连接；
+// 与 Remote Edge 共用同一 edge.SendReject 实现（客户端行为契约）。
 func (s *Server) sendReject(c *connection.Conn, typ messages.RejectType, reason string) error {
-	writeErr := c.WriteMessage(protocol.MessageReject, &messages.Reject{Type: typ, Reason: reason})
-	// Murmur disconnects immediately after sending Reject (murmur/Messages.cpp:
-	// sendMessage(reject) then disconnectSocket()). Official clients raise the
-	// password retry prompt from the disconnect event, keyed on the reject type,
-	// so a rejected connection must not linger or the prompt fires at a random
-	// later moment (ping watchdog, manual disconnect, next reconnect). The
-	// flush-then-close is async because the writer only drains once the client
-	// reads the Reject; the pipe write receipt itself orders close after delivery.
-	go c.CloseAfterFlush()
-	return writeErr
+	return edge.SendReject(c, typ, reason)
 }
 
 func cryptoModeString(mode crypto.Mode) string {
@@ -2047,28 +2005,10 @@ func (s *Server) broadcastRecordingAnnouncement(name string, recording bool) {
 }
 
 // handleCryptSetup is a Local Edge entry: nonce resync reads the UDP crypto
-// state, which never crosses the Core/Edge boundary.
+// state, which never crosses the Core/Edge boundary. The resync itself is the
+// shared edge.CryptSetupResync so a Remote Edge behaves identically.
 func (s *Server) handleCryptSetup(msgType protocol.MessageType, payload []byte, ctx interface{}) error {
-	c := ctx.(*connection.Conn)
-	if c.Crypt == nil {
-		return nil
-	}
-	var cs messages.CryptSetup
-	if len(payload) > 0 {
-		if err := cs.Unmarshal(payload); err != nil {
-			return err
-		}
-	}
-	if len(cs.ClientNonce) > 0 {
-		_ = c.Crypt.SetDecNonce(cs.ClientNonce)
-	}
-	if len(cs.ServerNonce) > 0 || (len(cs.Key) == 0 && len(cs.ClientNonce) == 0) {
-		encNonce := c.Crypt.EncNonce()
-		if len(encNonce) > 0 {
-			_ = c.WriteMessage(protocol.MessageCryptSetup, &messages.CryptSetup{ServerNonce: encNonce})
-		}
-	}
-	return nil
+	return edge.CryptSetupResync(ctx.(*connection.Conn), payload)
 }
 
 func (s *Server) handleChannelState(msgType protocol.MessageType, payload []byte, c Peer) error {

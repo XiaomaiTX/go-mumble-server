@@ -55,6 +55,15 @@ func (r *Registry) RegisterEdge(id EdgeID, generation uint64) error {
 	return nil
 }
 
+// EdgeRegistered reports whether an edge with this ID is currently registered.
+// Read-only composition introspection; it changes no lifecycle state.
+func (r *Registry) EdgeRegistered(id EdgeID) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	_, ok := r.edges[id]
+	return ok
+}
+
 func (r *Registry) Bind(ref SessionRef, edge EdgeID) error {
 	if !ref.Valid() {
 		return ErrInvalidSession

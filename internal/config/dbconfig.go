@@ -160,6 +160,10 @@ func ConfigForServer(meta *MetaConfig, server *ServerConfigData, bootstrap *Conf
 		cfg.DatabasePath = bootstrap.DatabasePath
 		cfg.SSLCertPath = bootstrap.SSLCertPath
 		cfg.SSLKeyPath = bootstrap.SSLKeyPath
+		cfg.EdgeListenAddr = bootstrap.EdgeListenAddr
+		cfg.CoreAddress = bootstrap.CoreAddress
+		cfg.EdgeID = bootstrap.EdgeID
+		cfg.CoreCACertPath = bootstrap.CoreCACertPath
 		cfg.LogLevel = bootstrap.LogLevel
 		cfg.FrontendEmbed = bootstrap.FrontendEmbed
 		cfg.AuthMode = bootstrap.AuthMode

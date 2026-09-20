@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -15,15 +16,16 @@ type RuntimeMode string
 const (
 	ModeStandalone RuntimeMode = "standalone"
 	ModeCore       RuntimeMode = "core"
+	ModeEdge       RuntimeMode = "edge"
 )
 
 func ParseRuntimeMode(value string) (RuntimeMode, error) {
 	mode := RuntimeMode(strings.ToLower(strings.TrimSpace(value)))
 	switch mode {
-	case ModeStandalone, ModeCore:
+	case ModeStandalone, ModeCore, ModeEdge:
 		return mode, nil
 	default:
-		return "", fmt.Errorf("invalid distributed mode %q (expected standalone or core)", value)
+		return "", fmt.Errorf("invalid distributed mode %q (expected standalone, core or edge)", value)
 	}
 }
 
@@ -37,6 +39,20 @@ type Config struct {
 	DatabasePath   string
 	SSLCertPath    string
 	SSLKeyPath     string
+	// EdgeListenAddr is the core-mode listener address reserved for the future
+	// Remote Edge server ([distributed].edge_listen). Optional: the wire
+	// protocol is not implemented yet, so an empty value keeps the capability
+	// registered but disabled.
+	EdgeListenAddr string
+	// CoreAddress is the remote Core the edge mode connects to
+	// ([distributed].core_address); required in edge mode.
+	CoreAddress string
+	// EdgeID is this edge instance's identity ([distributed].edge_id);
+	// required in edge mode.
+	EdgeID string
+	// CoreCACertPath is the future Core trust anchor for edge-core mTLS
+	// ([distributed].core_ca_cert). Optional skeleton entry point.
+	CoreCACertPath string
 	MaxUsers       int
 	MaxBandwidth   int
 	LogLevel       string
@@ -83,7 +99,11 @@ type Config struct {
 // fileConfig mirrors the TOML structure for parsing.
 type fileConfig struct {
 	Distributed struct {
-		Mode string `toml:"mode"`
+		Mode        string `toml:"mode"`
+		EdgeListen  string `toml:"edge_listen"`
+		CoreAddress string `toml:"core_address"`
+		EdgeID      string `toml:"edge_id"`
+		CoreCACert  string `toml:"core_ca_cert"`
 	} `toml:"distributed"`
 	Network struct {
 		Port     int    `toml:"port"`
@@ -197,6 +217,18 @@ func applyFileConfig(cfg *Config, fc *fileConfig) {
 	if fc.Distributed.Mode != "" {
 		cfg.Mode = RuntimeMode(strings.ToLower(strings.TrimSpace(fc.Distributed.Mode)))
 	}
+	if fc.Distributed.EdgeListen != "" {
+		cfg.EdgeListenAddr = fc.Distributed.EdgeListen
+	}
+	if fc.Distributed.CoreAddress != "" {
+		cfg.CoreAddress = fc.Distributed.CoreAddress
+	}
+	if fc.Distributed.EdgeID != "" {
+		cfg.EdgeID = fc.Distributed.EdgeID
+	}
+	if fc.Distributed.CoreCACert != "" {
+		cfg.CoreCACertPath = fc.Distributed.CoreCACert
+	}
 	if fc.Network.Host != "" {
 		cfg.Host = fc.Network.Host
 	}
@@ -276,6 +308,18 @@ func applyFileConfig(cfg *Config, fc *fileConfig) {
 func applyEnv(cfg *Config) {
 	if v := os.Getenv("MUMBLE_MODE"); v != "" {
 		cfg.Mode = RuntimeMode(strings.ToLower(strings.TrimSpace(v)))
+	}
+	if v := os.Getenv("MUMBLE_EDGE_LISTEN"); v != "" {
+		cfg.EdgeListenAddr = v
+	}
+	if v := os.Getenv("MUMBLE_CORE_ADDRESS"); v != "" {
+		cfg.CoreAddress = v
+	}
+	if v := os.Getenv("MUMBLE_EDGE_ID"); v != "" {
+		cfg.EdgeID = v
+	}
+	if v := os.Getenv("MUMBLE_CORE_CA_CERT"); v != "" {
+		cfg.CoreCACertPath = v
 	}
 	if v := os.Getenv("MUMBLE_HOST"); v != "" {
 		cfg.Host = v
@@ -408,4 +452,54 @@ func applyEnv(cfg *Config) {
 	if v := os.Getenv("MUMBLE_IDENTITY_REVALIDATE_TOKEN"); v != "" {
 		cfg.IdentityRevalidateToken = v
 	}
+}
+
+// ValidateForMode checks that the configuration carries the dependencies the
+// selected runtime mode actually constructs. It runs in the composition root
+// before any database is opened or listener bound, so an illegal deployment
+// fails with a config error instead of a half-started process.
+func ValidateForMode(cfg *Config) error {
+	switch cfg.Mode {
+	case ModeStandalone, ModeCore:
+		if cfg.DatabasePath == "" {
+			return fmt.Errorf("mode %q requires [distributed] database path", cfg.Mode)
+		}
+		if err := validateCertPair(cfg.SSLCertPath, cfg.SSLKeyPath); err != nil {
+			return err
+		}
+		if cfg.Mode == ModeCore && cfg.EdgeListenAddr != "" {
+			if _, _, err := net.SplitHostPort(cfg.EdgeListenAddr); err != nil {
+				return fmt.Errorf("distributed.edge_listen = %q is not host:port", cfg.EdgeListenAddr)
+			}
+		}
+		return nil
+	case ModeEdge:
+		if cfg.CoreAddress == "" {
+			return fmt.Errorf("mode %q requires distributed.core_address (the remote Core this edge forwards to)", cfg.Mode)
+		}
+		if _, _, err := net.SplitHostPort(cfg.CoreAddress); err != nil {
+			return fmt.Errorf("distributed.core_address = %q is not host:port", cfg.CoreAddress)
+		}
+		if cfg.EdgeID == "" {
+			return fmt.Errorf("mode %q requires distributed.edge_id (this edge instance's identity)", cfg.Mode)
+		}
+		if err := validateCertPair(cfg.SSLCertPath, cfg.SSLKeyPath); err != nil {
+			return err
+		}
+		if cfg.CoreCACertPath != "" {
+			if _, err := os.Stat(cfg.CoreCACertPath); err != nil {
+				return fmt.Errorf("distributed.core_ca_cert %q unreadable: %w", cfg.CoreCACertPath, err)
+			}
+		}
+		return nil
+	default:
+		return fmt.Errorf("unsupported runtime mode %q", cfg.Mode)
+	}
+}
+
+func validateCertPair(certPath, keyPath string) error {
+	if (certPath == "") != (keyPath == "") {
+		return fmt.Errorf("tls cert and key must be configured together (cert=%q key=%q)", certPath, keyPath)
+	}
+	return nil
 }

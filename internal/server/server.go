@@ -2,43 +2,44 @@ package server
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io/fs"
 	"log/slog"
-	"net"
 	"net/http"
 	"sync"
-	"time"
 
 	"github.com/dchote/go-mumble-server/internal/cert"
 	"github.com/dchote/go-mumble-server/internal/channel"
-	"github.com/dchote/go-mumble-server/internal/cluster"
 	"github.com/dchote/go-mumble-server/internal/config"
-	"github.com/dchote/go-mumble-server/internal/connection"
 	"github.com/dchote/go-mumble-server/internal/database"
 	"github.com/dchote/go-mumble-server/internal/discovery"
+	"github.com/dchote/go-mumble-server/internal/edge"
 	"github.com/dchote/go-mumble-server/internal/mumble"
 	"github.com/dchote/go-mumble-server/internal/rest"
 	"github.com/dchote/go-mumble-server/internal/transport"
 	pkgmumble "github.com/dchote/go-mumble-server/pkg/mumble"
-	"github.com/dchote/go-mumble-server/pkg/mumble/crypto"
-	"github.com/dchote/go-mumble-server/pkg/mumble/protocol"
-	"github.com/dchote/go-mumble-server/pkg/mumble/protocol/messages"
 	"golang.org/x/sync/errgroup"
 	"gorm.io/gorm"
 )
 
-// Server represents the Mumble server (virtual server or Meta).
+// Server is the mode-agnostic standalone/core process runtime: the in-process
+// Core (mumble.Server), the Local Edge adapter, the shared client transport
+// and the REST plane. Mode-specific composition — remote edge capability,
+// remote core client — belongs to internal/app, never here.
 type Server struct {
-	cfg     *config.Config
-	db      *gorm.DB
-	feFS    fs.FS
+	cfg  *config.Config
+	db   *gorm.DB
+	feFS fs.FS
+
 	mu      sync.Mutex
 	http    *http.Server
-	tcpLn   interface{ Close() error }
-	udpConn interface{ Close() error }
+	runtime *edge.ClientRuntime
 	mdns    *discovery.Server
+
+	// ms is the in-process Core; runCfg is the persisted-config-merged view
+	// Run needs. Both are set by Prepare and read-only afterwards.
+	ms     *mumble.Server
+	runCfg *config.Config
 }
 
 // New creates a new Server.
@@ -46,8 +47,18 @@ func New(cfg *config.Config, db *gorm.DB, feFS fs.FS) *Server {
 	return &Server{cfg: cfg, db: db, feFS: feFS}
 }
 
-// Start begins accepting Mumble and REST connections.
-func (s *Server) Start(ctx context.Context) error {
+// Mumble exposes the in-process Core so the composition root can wire
+// Core-owned capabilities (e.g. the remote edge server) to its registry.
+func (s *Server) Mumble() *mumble.Server { return s.ms }
+
+// ClientRuntime exposes the shared client transport for shutdown wiring.
+func (s *Server) ClientRuntime() *edge.ClientRuntime { return s.runtime }
+
+// Prepare loads persisted configuration, provisions the TLS identity, binds
+// the client sockets and constructs the Core + Local Edge + client runtime
+// graph. It must complete before Run; capabilities that need the Core's
+// registry (RemoteEdgeServer in core mode) are injected between the two.
+func (s *Server) Prepare(ctx context.Context) error {
 	if err := config.EnsureMetaConfig(s.db, s.cfg); err != nil {
 		return fmt.Errorf("ensure meta config: %w", err)
 	}
@@ -80,34 +91,25 @@ func (s *Server) Start(ctx context.Context) error {
 		}
 	}
 
-	mumbleAddr := formatAddr(cfg.Host, cfg.MumblePort)
-	restAddr := formatAddr(cfg.Host, cfg.RESTPort)
-
-	tcpLn, err := transport.TCPListener(ctx, mumbleAddr, certPEM, keyPEM)
-	if err != nil {
-		return err
-	}
-	s.mu.Lock()
-	s.tcpLn = tcpLn
-	s.mu.Unlock()
-	slog.Info("Mumble TCP/TLS listening", "addr", mumbleAddr)
-
-	udpConn, err := transport.UDPListener(ctx, mumbleAddr)
-	if err != nil {
-		tcpLn.Close()
-		return err
-	}
-	s.mu.Lock()
-	s.udpConn = udpConn
-	s.mu.Unlock()
-	slog.Info("Mumble UDP listening", "addr", mumbleAddr)
-
-	ms := mumble.NewServer(cfg, s.db, 1, udpConn)
+	ms := mumble.NewServer(cfg, s.db, 1, nil)
 	if err := ms.IdentityAuthorityStatus(); err != nil {
-		_ = udpConn.Close()
-		_ = tcpLn.Close()
 		return fmt.Errorf("initialize identity authority: %w", err)
 	}
+	localEdge := mumble.NewLocalEdge(ms)
+	runtime := edge.NewClientRuntime(edge.ClientRuntimeConfig{
+		Addr:      formatAddr(cfg.Host, cfg.MumblePort),
+		CertPEM:   certPEM,
+		KeyPEM:    keyPEM,
+		Ingress:   localEdge.Ingress(),
+		HandleUDP: localEdge.HandleUDP,
+		SetupConn: localEdge.SetupConn,
+		OnClose:   localEdge.OnClose,
+	})
+	if err := runtime.Listen(ctx); err != nil {
+		return err
+	}
+	ms.SetUDPConn(runtime.UDPConn())
+
 	getChanMgr := func(serverID uint) *channel.Manager {
 		if serverID == 1 {
 			return ms.ChanManager()
@@ -148,12 +150,24 @@ func (s *Server) Start(ctx context.Context) error {
 		ms.SetContentPolicy(serverCfg.AllowRecording, serverCfg.MaxTextMessageLength, serverCfg.MaxImageMessageLength)
 	}
 	handler := rest.RouterWithMumbleAndIdentity(s.db, cfg, s.feFS, &rest.MumbleUserAdapter{Manager: ms.UserManager(), Server: ms}, &rest.MumbleUserActionAdapter{Server: ms, ServerID: 1}, &rest.MumbleChannelCryptoAdapter{Server: ms, ServerID: 1}, getChanMgr, onACLChange, onBanChange, onChannelMutated, onConfigChange, ms.RevalidateUserNow)
+
+	s.mu.Lock()
+	s.ms = ms
+	s.runCfg = cfg
+	s.runtime = runtime
 	s.http = &http.Server{
-		Addr:    restAddr,
+		Addr:    formatAddr(cfg.Host, cfg.RESTPort),
 		Handler: handler,
 	}
-	slog.Info("REST API listening", "addr", restAddr)
+	s.mu.Unlock()
+	slog.Info("REST API listening", "addr", formatAddr(cfg.Host, cfg.RESTPort))
+	return nil
+}
 
+// Run serves Mumble (control + UDP) and REST connections until ctx is
+// cancelled or a loop fails. Prepare must have completed.
+func (s *Server) Run(ctx context.Context) error {
+	cfg := s.runCfg
 	g, gctx := errgroup.WithContext(ctx)
 
 	g.Go(func() error {
@@ -164,15 +178,11 @@ func (s *Server) Start(ctx context.Context) error {
 	})
 
 	g.Go(func() error {
-		return s.acceptLoop(gctx, tcpLn, ms)
+		return s.runtime.Run(gctx)
 	})
 
 	g.Go(func() error {
-		return s.udpReadLoop(gctx, udpConn, ms)
-	})
-
-	g.Go(func() error {
-		return ms.StartIdentityRevalidation(gctx)
+		return s.ms.StartIdentityRevalidation(gctx)
 	})
 
 	if cfg.Bonjour {
@@ -200,93 +210,6 @@ func formatAddr(host string, port int) string {
 	return fmt.Sprintf("%s:%d", host, port)
 }
 
-func (s *Server) acceptLoop(ctx context.Context, ln net.Listener, ms *mumble.Server) error {
-	for {
-		raw, err := ln.Accept()
-		if err != nil {
-			if errors.Is(err, net.ErrClosed) || ctx.Err() != nil {
-				return nil
-			}
-			return err
-		}
-		crypt := crypto.NewCryptState(crypto.ModeLegacy)
-		remoteAddr := raw.RemoteAddr().String()
-		slog.Info("Mumble client connected", "remote", remoteAddr)
-		conn := connection.New(raw, crypt, func(c *connection.Conn) {
-			sid := c.SessionID()
-			name := c.UserName()
-			// The conn pins the exact logical session (ID + generation) it was
-			// authenticated as, so a disconnect callback delayed past a session
-			// ID reuse cleans up only its own generation.
-			ref := cluster.SessionRef{SessionID: sid, Generation: c.SessionGeneration()}
-			var removed bool
-			var u pkgmumble.User
-			if ref.Valid() {
-				announced := ms.UnregisterConn(ref)
-				u, removed = ms.UserManager().RemoveIfGeneration(sid, ref.Generation)
-				if removed && u.ChannelID != 0 {
-					ms.UpdateChannelCrypto(u.ChannelID)
-				}
-				// Only sessions whose join was announced get a UserRemove; a
-				// never-announced session must not produce a ghost removal.
-				if announced {
-					ms.Broadcast(sid, protocol.MessageUserRemove, &messages.UserRemove{Session: sid, Actor: 0})
-				}
-			}
-			if name != "" || removed {
-				n := name
-				if removed {
-					n = u.Name
-				}
-				slog.Info("Mumble client disconnected", "remote", remoteAddr, "session", sid, "user", n)
-			} else {
-				slog.Info("Mumble client disconnected", "remote", remoteAddr, "session", sid)
-			}
-		})
-		// Typed business metric from the edge-terminated TCP Ping; the ping
-		// echo and crypto counters never enter Core handlers.
-		conn.SetPingReporter(func(pc *connection.Conn, avgMicros float32) {
-			ms.UserManager().SetPing(pc.SessionID(), avgMicros)
-		})
-		go func() {
-			_ = conn.WriteMessage(protocol.MessageVersion, &messages.Version{
-				VersionV1:   ms.ProtocolVersionV1(),
-				VersionV2:   ms.ProtocolVersionV2(),
-				Release:     "go-mumble-server",
-				OS:          "Go",
-				OSVersion:   "1.0",
-				CryptoModes: 0x07, // lite(1) | legacy(2) | secure(4) — server supports all
-			})
-			_ = conn.Run(ctx, ms.HandlerTable())
-		}()
-	}
-}
-
-func (s *Server) udpReadLoop(ctx context.Context, conn net.PacketConn, ms *mumble.Server) error {
-	buf := make([]byte, 65535)
-	for {
-		conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
-		n, addr, err := conn.ReadFrom(buf)
-		if err != nil {
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				select {
-				case <-ctx.Done():
-					return nil
-				default:
-					continue
-				}
-			}
-			if errors.Is(err, net.ErrClosed) || ctx.Err() != nil {
-				return nil
-			}
-			return err
-		}
-		if n > 0 && ms != nil {
-			ms.HandleUDP(addr, buf[:n])
-		}
-	}
-}
-
 // Shutdown gracefully stops the server.
 func (s *Server) Shutdown(ctx context.Context) error {
 	slog.Info("Server shutting down")
@@ -295,13 +218,8 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	if s.http != nil {
 		s.http.Shutdown(ctx)
 	}
-	if s.tcpLn != nil {
-		s.tcpLn.Close()
-		s.tcpLn = nil
-	}
-	if s.udpConn != nil {
-		s.udpConn.Close()
-		s.udpConn = nil
+	if s.runtime != nil {
+		_ = s.runtime.Close()
 	}
 	if s.mdns != nil {
 		s.mdns.Shutdown()

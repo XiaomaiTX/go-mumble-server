@@ -333,3 +333,33 @@ func TestVoiceDeliveryRacesWithDisconnectCleanup(t *testing.T) {
 	close(stop)
 	wg.Wait()
 }
+
+// A remote session owns no local conn, so the REST ban path
+// (BanAndKickSession → appendSessionBan) must resolve the ban purely from
+// stored metadata: the socket fallback there is local-edge-only and remote
+// sessions must never depend on it.
+func TestRemoteSessionBanRequiresNoSocketFallback(t *testing.T) {
+	s := newVoiceTargetTestServer(t)
+	root := s.chans.RootID()
+	remote := &mumble.User{Name: "remote", ChannelID: root, Address: "203.0.113.9"}
+	connectRemoteTestUser(t, s, remote, nil)
+	if s.conn(remote.SessionID) != nil {
+		t.Fatal("remote session unexpectedly owns a local conn")
+	}
+
+	if !s.BanAndKickSession(remote.SessionID, "abuse") {
+		t.Fatal("BanAndKickSession reported failure")
+	}
+	banned := false
+	for _, e := range s.bans.List() {
+		if e.Address != nil && net.IP(e.Address).Equal(net.ParseIP("203.0.113.9")) {
+			banned = true
+		}
+	}
+	if !banned {
+		t.Fatalf("远端会话的 REST ban 未使用存储的 IP，bans=%v", s.bans.List())
+	}
+	if _, ok := s.users.SnapshotByName("remote"); ok {
+		t.Fatal("远端用户未被移除")
+	}
+}

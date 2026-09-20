@@ -79,5 +79,15 @@ client_key = ""
 # 外部身份服务调用在线重验入口时使用，必须与 service_token 不同。
 identity_revalidate_token = ""
 [distributed]
-# core 当前仍启动本地 Mumble TCP/UDP 服务，仅启用内部远端 Edge 能力。
+# 运行模式：standalone（单进程完整服务）、core（standalone + 远端 Edge 接入能力）、
+# edge（边缘进程，无本地数据库，所有权威决策转发给 core_address 指定的 Core）。
+# edge 模式必须提供 core_address 与 edge_id，否则启动失败。
 mode = "standalone"
+# core 模式：远端 Edge 接入监听地址（edge-core 协议尚未实现，当前仅注册能力）。
+# edge_listen = "0.0.0.0:64740"
+# edge 模式：权威 Core 的地址，必填（host:port）。
+# core_address = "10.0.0.1:64740"
+# edge 模式：本 Edge 实例 ID，必填。
+# edge_id = "edge-01"
+# edge 模式：验证 Core 身份的 CA 证书路径（edge-core mTLS，协议实现后生效）。
+# core_ca_cert = "/etc/go-mumble-server/core-ca.crt"

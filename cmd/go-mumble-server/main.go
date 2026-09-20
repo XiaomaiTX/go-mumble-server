@@ -11,9 +11,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/dchote/go-mumble-server/internal/app"
 	"github.com/dchote/go-mumble-server/internal/config"
-	"github.com/dchote/go-mumble-server/internal/database"
-	"github.com/dchote/go-mumble-server/internal/server"
 )
 
 var (
@@ -30,7 +29,7 @@ func main() {
 
 	configPath := flag.String("config", "", "Path to mumble-server.toml")
 	frontendEmbed := flag.Bool("frontend-embed", true, "Serve embedded web UI on REST port")
-	mode := flag.String("mode", "", "Runtime mode: standalone or core")
+	mode := flag.String("mode", "", "Runtime mode: standalone, core or edge")
 	flag.Parse()
 
 	cfg, err := config.Load(*configPath)
@@ -50,12 +49,6 @@ func main() {
 
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})))
 
-	db, err := database.Open(cfg.DatabasePath)
-	if err != nil {
-		slog.Error("database open failed", "err", err)
-		os.Exit(1)
-	}
-
 	var feFS fs.FS
 	if cfg.FrontendEmbed {
 		feFS, err = getFrontendFS()
@@ -64,18 +57,23 @@ func main() {
 		}
 	}
 
-	srv := server.New(cfg, db, feFS)
 	ctx, cancel := context.WithCancel(context.Background())
+	application, err := app.Build(ctx, cfg, feFS)
+	if err != nil {
+		slog.Error("runtime composition failed", "mode", cfg.Mode, "err", err)
+		os.Exit(1)
+	}
+
 	done := make(chan error, 1)
 	go func() {
-		done <- srv.Start(ctx)
+		done <- application.Run(ctx)
 	}()
 
 	<-waitForShutdown()
 	cancel()
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
-	_ = srv.Shutdown(shutdownCtx)
+	_ = application.Shutdown(shutdownCtx)
 	if err := <-done; err != nil {
 		slog.Error("server exit", "err", err)
 	}
