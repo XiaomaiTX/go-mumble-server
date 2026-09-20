@@ -78,3 +78,6 @@ client_cert = ""
 client_key = ""
 # 外部身份服务调用在线重验入口时使用，必须与 service_token 不同。
 identity_revalidate_token = ""
+[distributed]
+# core 当前仍启动本地 Mumble TCP/UDP 服务，仅启用内部远端 Edge 能力。
+mode = "standalone"

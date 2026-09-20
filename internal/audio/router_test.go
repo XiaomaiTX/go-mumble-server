@@ -1,14 +1,19 @@
 package audio
 
 import (
+	"github.com/dchote/go-mumble-server/internal/cluster"
 	ma "github.com/dchote/go-mumble-server/pkg/mumble/audio"
 	"testing"
 )
 
 type captureSender map[uint32][]ma.Delivery
 
-func (s captureSender) SendAudio(id uint32, d ma.Delivery, _ *ma.EncodingCache) error {
-	s[id] = append(s[id], d)
+func (s captureSender) SendVoice(_ cluster.SessionRef, frame ma.Frame, recipients []Recipient) error {
+	for _, recipient := range recipients {
+		d := recipient.Delivery
+		d.Frame = frame
+		s[recipient.SessionID] = append(s[recipient.SessionID], d)
+	}
 	return nil
 }
 func TestRouteContextsMergeAndGates(t *testing.T) {

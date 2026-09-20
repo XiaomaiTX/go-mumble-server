@@ -2,10 +2,10 @@ package mumble
 
 import (
 	ma "github.com/dchote/go-mumble-server/pkg/mumble/audio"
-	"net"
 
 	"github.com/dchote/go-mumble-server/internal/acl"
-	"github.com/dchote/go-mumble-server/internal/connection"
+	"github.com/dchote/go-mumble-server/internal/audio"
+	"github.com/dchote/go-mumble-server/internal/cluster"
 	"github.com/dchote/go-mumble-server/pkg/mumble"
 	"github.com/dchote/go-mumble-server/pkg/mumble/protocol/messages"
 )
@@ -13,30 +13,39 @@ import (
 // voiceTargetSpec 保留频道语义；显式用户目标绑定连接身份，不能随 session 复用转移。
 // 发布后不再修改，所有读取和更新均在 connMu 下进行。
 type voiceTargetSpec struct {
-	owner    *connection.Conn
-	sessions map[uint32]*connection.Conn
+	owner    cluster.SessionRef
+	sessions map[uint32]cluster.SessionRef
 	channels []messages.VoiceTargetTarget
 }
 
 type voiceRecipient struct {
 	session  uint32
-	conn     *connection.Conn
-	addr     net.Addr
+	ref      cluster.SessionRef
 	delivery ma.Delivery
 }
 
-func (s *Server) storeVoiceTarget(c *connection.Conn, vt messages.VoiceTarget) {
+func (s *Server) storeVoiceTarget(c Peer, vt messages.VoiceTarget) {
 	s.connMu.Lock()
 	defer s.connMu.Unlock()
 	sid := c.SessionID()
-	if s.conns[sid] != c {
+	owner, ok := s.users.Snapshot(sid)
+	if !ok || owner.SessionGeneration != c.SessionGeneration() {
 		return
 	}
-	spec := voiceTargetSpec{owner: c, sessions: make(map[uint32]*connection.Conn)}
+	ownerRef := cluster.SessionRef{SessionID: sid, Generation: owner.SessionGeneration}
+	// Eligibility is registry lifecycle, never the local conn table: a remote
+	// edge session (no local conn) can own voice targets too.
+	if _, ok := s.registry.Snapshot(ownerRef); !ok {
+		return
+	}
+	spec := voiceTargetSpec{owner: ownerRef, sessions: make(map[uint32]cluster.SessionRef)}
 	for _, target := range vt.Targets {
 		for _, id := range target.Session {
-			if recipient := s.conns[id]; recipient != nil && s.users.Exists(id) {
-				spec.sessions[id] = recipient
+			if recipient, found := s.users.Snapshot(id); found {
+				ref := cluster.SessionRef{SessionID: id, Generation: recipient.SessionGeneration}
+				if _, ok := s.registry.Snapshot(ref); ok {
+					spec.sessions[id] = ref
+				}
 			}
 		}
 		if target.HasChannelID {
@@ -73,7 +82,7 @@ func (s *Server) resolveVoiceTarget(sessionID uint32, targetID uint8) []voiceRec
 		return nil
 	}
 	spec, ok := v.(map[uint8]voiceTargetSpec)[targetID]
-	if !ok || spec.owner != s.conns[sessionID] || spec.owner.State() != connection.StateActive {
+	if !ok || !s.registry.Active(spec.owner) {
 		return nil
 	}
 	speaker, ok := s.users.Snapshot(sessionID)
@@ -99,8 +108,8 @@ func (s *Server) resolveVoiceTarget(sessionID uint32, targetID uint8) []voiceRec
 		if u.SessionID == sessionID || u.Deaf || u.SelfDeaf {
 			return
 		}
-		c := s.conns[u.SessionID]
-		if c == nil || c.State() != connection.StateActive {
+		ref := cluster.SessionRef{SessionID: u.SessionID, Generation: u.SessionGeneration}
+		if !s.registry.Active(ref) {
 			return
 		}
 		d := ma.Delivery{Context: context, VolumeAdjustment: volume}
@@ -109,15 +118,13 @@ func (s *Server) resolveVoiceTarget(sessionID uint32, targetID uint8) []voiceRec
 			return
 		}
 		seen[u.SessionID] = len(recipients)
-		addr, _ := s.addrBySession.Load(u.SessionID)
-		a, _ := addr.(net.Addr)
-		recipients = append(recipients, voiceRecipient{session: u.SessionID, conn: c, addr: a, delivery: d})
+		recipients = append(recipients, voiceRecipient{session: u.SessionID, ref: ref, delivery: d})
 	}
 	for sid, expected := range spec.sessions {
-		if s.conns[sid] != expected {
+		if !s.registry.Active(expected) {
 			continue
 		}
-		if u, ok := s.users.Snapshot(sid); ok && canWhisper(u.ChannelID) {
+		if u, ok := s.users.Snapshot(sid); ok && u.SessionGeneration == expected.Generation && canWhisper(u.ChannelID) {
 			add(u, ma.ContextWhisper, 1)
 		}
 	}
@@ -173,17 +180,14 @@ func (s *Server) getVoiceTargetRecipients(sessionID uint32, targetID uint8) []ui
 	return ids
 }
 
-func (s *Server) routeVoiceTarget(sessionID uint32, targetID uint8, frame ma.Frame, cache *ma.EncodingCache) error {
-	for _, r := range s.resolveVoiceTarget(sessionID, targetID) {
-		var addr interface{}
-		if r.addr != nil {
-			addr = r.addr
-		}
-		d := r.delivery
-		d.Frame = frame
-		_ = s.sendDeliveryTo(r.session, r.conn, addr, d, cache)
+func (s *Server) resolveVoiceTargetCanonical(sessionID uint32, targetID uint8, frame ma.Frame) []audio.Recipient {
+	resolved := s.resolveVoiceTarget(sessionID, targetID)
+	out := make([]audio.Recipient, 0, len(resolved))
+	for _, recipient := range resolved {
+		recipient.delivery.Frame = frame
+		out = append(out, audio.Recipient{SessionID: recipient.session, Session: recipient.ref, Delivery: recipient.delivery})
 	}
-	return nil
+	return out
 }
 
 // removeVoiceTargetsLocked 在断线时释放其他目标对旧连接的引用；调用方持有 connMu 写锁。
@@ -196,10 +200,10 @@ func (s *Server) removeVoiceTargetsLocked(sessionID uint32) {
 		for id, spec := range targets {
 			if _, ok := spec.sessions[sessionID]; ok {
 				changed = true
-				sessions := make(map[uint32]*connection.Conn, len(spec.sessions))
-				for sid, c := range spec.sessions {
+				sessions := make(map[uint32]cluster.SessionRef, len(spec.sessions))
+				for sid, ref := range spec.sessions {
 					if sid != sessionID {
-						sessions[sid] = c
+						sessions[sid] = ref
 					}
 				}
 				spec.sessions = sessions

@@ -10,30 +10,48 @@ import (
 	"github.com/BurntSushi/toml"
 )
 
+type RuntimeMode string
+
+const (
+	ModeStandalone RuntimeMode = "standalone"
+	ModeCore       RuntimeMode = "core"
+)
+
+func ParseRuntimeMode(value string) (RuntimeMode, error) {
+	mode := RuntimeMode(strings.ToLower(strings.TrimSpace(value)))
+	switch mode {
+	case ModeStandalone, ModeCore:
+		return mode, nil
+	default:
+		return "", fmt.Errorf("invalid distributed mode %q (expected standalone or core)", value)
+	}
+}
+
 // Config holds the server configuration.
 type Config struct {
-	Host                      string
-	MumblePort                int
-	RESTPort                  int
-	FrontendEmbed             bool
-	DatabasePath              string
-	SSLCertPath               string
-	SSLKeyPath                string
-	MaxUsers                  int
-	MaxBandwidth              int
-	LogLevel                  string
-	JWTIssuer                 string
-	JWTAudience               string
-	JWTExpiryDays             int
-	ChannelDepth              int
-	ChannelCount              int
-	WelcomeText               string
-	ServerPassword            string
-	DefaultChannel            int
-	CertRequired              bool
-	Bonjour                   bool
-	RegisterName              string
-	VoiceDebug                bool
+	Mode           RuntimeMode
+	Host           string
+	MumblePort     int
+	RESTPort       int
+	FrontendEmbed  bool
+	DatabasePath   string
+	SSLCertPath    string
+	SSLKeyPath     string
+	MaxUsers       int
+	MaxBandwidth   int
+	LogLevel       string
+	JWTIssuer      string
+	JWTAudience    string
+	JWTExpiryDays  int
+	ChannelDepth   int
+	ChannelCount   int
+	WelcomeText    string
+	ServerPassword string
+	DefaultChannel int
+	CertRequired   bool
+	Bonjour        bool
+	RegisterName   string
+	VoiceDebug     bool
 	// AllowRecording mirrors murmur's allowRecording: when false a client that
 	// announces it started recording is disconnected instead of being relayed.
 	AllowRecording bool
@@ -64,6 +82,9 @@ type Config struct {
 
 // fileConfig mirrors the TOML structure for parsing.
 type fileConfig struct {
+	Distributed struct {
+		Mode string `toml:"mode"`
+	} `toml:"distributed"`
 	Network struct {
 		Port     int    `toml:"port"`
 		RestPort int    `toml:"rest_port"`
@@ -119,6 +140,7 @@ type fileConfig struct {
 // defaults returns the default configuration.
 func defaults() *Config {
 	return &Config{
+		Mode:          ModeStandalone,
 		Host:          "0.0.0.0",
 		MumblePort:    64738,
 		RESTPort:      64730,
@@ -165,10 +187,16 @@ func Load(path string) (*Config, error) {
 	}
 
 	applyEnv(cfg)
+	if _, err := ParseRuntimeMode(string(cfg.Mode)); err != nil {
+		return nil, err
+	}
 	return cfg, nil
 }
 
 func applyFileConfig(cfg *Config, fc *fileConfig) {
+	if fc.Distributed.Mode != "" {
+		cfg.Mode = RuntimeMode(strings.ToLower(strings.TrimSpace(fc.Distributed.Mode)))
+	}
 	if fc.Network.Host != "" {
 		cfg.Host = fc.Network.Host
 	}
@@ -246,6 +274,9 @@ func applyFileConfig(cfg *Config, fc *fileConfig) {
 }
 
 func applyEnv(cfg *Config) {
+	if v := os.Getenv("MUMBLE_MODE"); v != "" {
+		cfg.Mode = RuntimeMode(strings.ToLower(strings.TrimSpace(v)))
+	}
 	if v := os.Getenv("MUMBLE_HOST"); v != "" {
 		cfg.Host = v
 	}

@@ -2,11 +2,13 @@ package mumble
 
 import (
 	"bytes"
+	"context"
 	ma "github.com/dchote/go-mumble-server/pkg/mumble/audio"
 	"net"
 	"testing"
 
 	"github.com/dchote/go-mumble-server/internal/channel"
+	"github.com/dchote/go-mumble-server/internal/cluster"
 	"github.com/dchote/go-mumble-server/internal/connection"
 	"github.com/dchote/go-mumble-server/pkg/mumble"
 	"github.com/dchote/go-mumble-server/pkg/mumble/protocol"
@@ -361,7 +363,7 @@ func TestUnregisterConnDropsListeners(t *testing.T) {
 	listenTo(t, s, bc, []uint32{ch.ID}, nil)
 	readUserState(t, bSide)
 
-	s.UnregisterConn(b.SessionID)
+	s.UnregisterConn(cluster.SessionRef{SessionID: b.SessionID, Generation: b.SessionGeneration})
 
 	if got := s.listeners.ChannelsFor(b.SessionID); len(got) != 0 {
 		t.Fatalf("ChannelsFor after unregister = %v, want empty", got)
@@ -424,12 +426,23 @@ func TestSendSyncIncludesListeningLists(t *testing.T) {
 		messages.VolumeAdjustment{ListeningChannel: ch.ID, VolumeAdjustment: 1.5})
 
 	c := &mumble.User{Name: "c", ChannelID: root}
-	cc, cSide := connectTestUser(t, s, c)
-	s.sendSync(cc, *c)
+	cc, cSide, ref := connectSyncingTestUser(t, s, c)
+	if err := s.sendSync(cc, *c, ref); err != nil {
+		t.Fatal(err)
+	}
+	// The commit barrier waits for the client to drain the initial lane, so it
+	// runs concurrently with the reads below, exactly like a real client.
+	committed := make(chan error, 1)
+	go func() { committed <- s.control.CommitSync(context.Background(), ref) }()
 
 	foundB := false
-	for i := 0; i < 32 && !foundB; i++ {
+	// Drain the whole initial lane: the commit barrier's write receipt only
+	// completes once ServerConfig, the last initial message, has been read.
+	for i := 0; i < 64; i++ {
 		kind, payload := readMessage(t, cSide)
+		if kind == protocol.MessageServerConfig {
+			break
+		}
 		if kind != protocol.MessageUserState {
 			continue
 		}
@@ -449,6 +462,9 @@ func TestSendSyncIncludesListeningLists(t *testing.T) {
 	}
 	if !foundB {
 		t.Fatal("sync never delivered b's UserState")
+	}
+	if err := <-committed; err != nil {
+		t.Fatal(err)
 	}
 }
 

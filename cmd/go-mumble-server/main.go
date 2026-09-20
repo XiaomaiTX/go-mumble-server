@@ -30,6 +30,7 @@ func main() {
 
 	configPath := flag.String("config", "", "Path to mumble-server.toml")
 	frontendEmbed := flag.Bool("frontend-embed", true, "Serve embedded web UI on REST port")
+	mode := flag.String("mode", "", "Runtime mode: standalone or core")
 	flag.Parse()
 
 	cfg, err := config.Load(*configPath)
@@ -38,6 +39,14 @@ func main() {
 		os.Exit(1)
 	}
 	cfg.FrontendEmbed = *frontendEmbed
+	if *mode != "" {
+		parsed, parseErr := config.ParseRuntimeMode(*mode)
+		if parseErr != nil {
+			slog.Error("config validation failed", "err", parseErr)
+			os.Exit(1)
+		}
+		cfg.Mode = parsed
+	}
 
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})))
 

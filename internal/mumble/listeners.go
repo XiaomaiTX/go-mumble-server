@@ -5,7 +5,6 @@ import (
 	"sync"
 
 	"github.com/dchote/go-mumble-server/internal/acl"
-	"github.com/dchote/go-mumble-server/internal/connection"
 	"github.com/dchote/go-mumble-server/pkg/mumble"
 	"github.com/dchote/go-mumble-server/pkg/mumble/protocol"
 	"github.com/dchote/go-mumble-server/pkg/mumble/protocol/messages"
@@ -214,7 +213,7 @@ func (m *listenerManager) ListeningVolumes(session uint32) []messages.VolumeAdju
 // murmur 的 Messages.cpp msgUserState）。已应用的增量以 truthful delta 广播：只广播
 // 真正生效的变更，而非回显原始请求（本服务端不误报未建立的状态）。音量调节只同步
 // 给监听者本人，对应 murmur broadcastListenerVolumeAdjustments=false 的默认值。
-func (s *Server) applyListening(c *connection.Conn, target mumble.User, add, remove []uint32, vols []messages.VolumeAdjustment) {
+func (s *Server) applyListening(c Peer, target mumble.User, add, remove []uint32, vols []messages.VolumeAdjustment) {
 	var appliedAdd, appliedRemove []uint32
 	var appliedVols []messages.VolumeAdjustment
 	subject := acl.SubjectOf(target)

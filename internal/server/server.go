@@ -13,6 +13,7 @@ import (
 
 	"github.com/dchote/go-mumble-server/internal/cert"
 	"github.com/dchote/go-mumble-server/internal/channel"
+	"github.com/dchote/go-mumble-server/internal/cluster"
 	"github.com/dchote/go-mumble-server/internal/config"
 	"github.com/dchote/go-mumble-server/internal/connection"
 	"github.com/dchote/go-mumble-server/internal/database"
@@ -214,12 +215,24 @@ func (s *Server) acceptLoop(ctx context.Context, ln net.Listener, ms *mumble.Ser
 		conn := connection.New(raw, crypt, func(c *connection.Conn) {
 			sid := c.SessionID()
 			name := c.UserName()
-			u, removed := ms.UserManager().Remove(sid)
-			ms.UnregisterConn(sid)
-			if removed && u.ChannelID != 0 {
-				ms.UpdateChannelCrypto(u.ChannelID)
+			// The conn pins the exact logical session (ID + generation) it was
+			// authenticated as, so a disconnect callback delayed past a session
+			// ID reuse cleans up only its own generation.
+			ref := cluster.SessionRef{SessionID: sid, Generation: c.SessionGeneration()}
+			var removed bool
+			var u pkgmumble.User
+			if ref.Valid() {
+				announced := ms.UnregisterConn(ref)
+				u, removed = ms.UserManager().RemoveIfGeneration(sid, ref.Generation)
+				if removed && u.ChannelID != 0 {
+					ms.UpdateChannelCrypto(u.ChannelID)
+				}
+				// Only sessions whose join was announced get a UserRemove; a
+				// never-announced session must not produce a ghost removal.
+				if announced {
+					ms.Broadcast(sid, protocol.MessageUserRemove, &messages.UserRemove{Session: sid, Actor: 0})
+				}
 			}
-			ms.Broadcast(sid, protocol.MessageUserRemove, &messages.UserRemove{Session: sid, Actor: 0})
 			if name != "" || removed {
 				n := name
 				if removed {
@@ -229,6 +242,11 @@ func (s *Server) acceptLoop(ctx context.Context, ln net.Listener, ms *mumble.Ser
 			} else {
 				slog.Info("Mumble client disconnected", "remote", remoteAddr, "session", sid)
 			}
+		})
+		// Typed business metric from the edge-terminated TCP Ping; the ping
+		// echo and crypto counters never enter Core handlers.
+		conn.SetPingReporter(func(pc *connection.Conn, avgMicros float32) {
+			ms.UserManager().SetPing(pc.SessionID(), avgMicros)
 		})
 		go func() {
 			_ = conn.WriteMessage(protocol.MessageVersion, &messages.Version{

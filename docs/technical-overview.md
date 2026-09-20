@@ -154,6 +154,7 @@ go-mumble-server/
 │   ├── server/                  # Virtual server lifecycle, Meta
 │   ├── cert/                    # TLS certificate persistence per virtual server
 │   ├── mumble/                  # Mumble protocol handler orchestration, per-vserver
+│   ├── cluster/                 # Session registry (SessionRef/generation), per-session FIFO control transport, edge-aware voice dispatcher
 │   ├── connection/              # Per-connection state, TLS, CryptState, read loop
 │   ├── transport/               # TCP/TLS and UDP listeners
 │   ├── handler/                 # REST API handlers
@@ -212,6 +213,16 @@ A client connection follows this sequence:
 9. **Disconnect** — TCP close or timeout. Server broadcasts `UserRemove`.
 
 See [patterns/connection-lifecycle-pattern.md](patterns/connection-lifecycle-pattern.md).
+
+### Core/Edge Session Architecture
+
+Phase 1 of the Core/Edge split ([plan 0014](spec/draft/0014-mumble-core-edge-plan.md)) separates the authoritative Core from local client transport **without changing single-machine behavior**. Ownership rules for every protocol message live in [architecture/core-edge-protocol-ownership.md](architecture/core-edge-protocol-ownership.md).
+
+- **Session registry** (`internal/cluster/registry.go`) — Logical sessions are keyed by `SessionRef{SessionID, SessionGeneration}`; a reused session ID gets a new generation, so stale bindings, voice deliveries, and cleanups from an old session can never hit the new one. Lifecycle: `Syncing → Active → Closing → Closed`, with an `announced` flag that gates `UserRemove` broadcasts (a session that never completed its initial sync produces no ghost removal).
+- **Control transport** (`internal/cluster/control.go`) — Per-session FIFO with an initial lane plus a bounded deferred queue. During initial sync, ordinary broadcasts to a syncing session are deferred; `CommitSync` waits for the write receipt of the whole initial lane (CryptSetup → CodecVersion → ChannelStates → self UserState → roster → ServerSync → ServerConfig), splices the deferred queue behind it, and only then commits the session to `Active`. Termination primitives `SendThenClose`/`CloseAfterFlush` deliver the final Reject/UserRemove as the last message before the socket closes.
+- **Voice dispatcher** (`internal/cluster/dispatcher.go`) — The audio router and VoiceTarget resolution produce canonical recipients; the dispatcher revalidates `SessionRef + Active`, groups recipients by Edge, and issues one `DeliverVoice` batch per edge per frame. The local edge adapter re-checks generation before encrypting/sending.
+- **Transitional `Peer` adapter** (`internal/mumble/peer.go`) — Control handlers depend on a two-method interface (`SessionID`, `WriteMessage`) instead of `*connection.Conn`. Only four handlers remain edge-local by design: `Version`, `Authenticate`, `CryptSetup`, and `UDPTunnel`. TCP `Ping` is terminated at the edge (timestamp + UDP crypto counters echoed locally); only the client-advertised `TCPPingAvg` reaches Core as a typed metric.
+- **Distributed mode** — `[distributed].mode = "core"` currently still starts the local Mumble TCP/UDP service; it enables internal remote-edge capability only and does **not** accept real remote Edges. The network protocol for remote Edges is the next phase.
 
 ### Protocol Handler
 

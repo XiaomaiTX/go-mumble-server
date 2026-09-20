@@ -49,6 +49,10 @@ type User struct {
 	// CertHash is the SHA-1 hex fingerprint of the client's TLS certificate (lowercase).
 	// Empty if the client did not present a certificate.
 	CertHash string
+	// ClientVersion is the packed protocol version (major<<48|minor<<32|patch<<16)
+	// from the client's Version message — the Core-owned copy of split-owned
+	// client metadata. 0 = unknown, treated as "very old".
+	ClientVersion uint64
 	// CryptoMode is the negotiated UDP crypto tier: "lite", "legacy", or "secure".
 	CryptoMode string
 	// IsSuperUser marks the connection that holds the reserved SuperUser identity.

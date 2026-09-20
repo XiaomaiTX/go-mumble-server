@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/dchote/go-mumble-server/internal/acl"
+	"github.com/dchote/go-mumble-server/internal/cluster"
 	"github.com/dchote/go-mumble-server/internal/config"
 	"github.com/dchote/go-mumble-server/internal/connection"
 	"github.com/dchote/go-mumble-server/internal/database"
@@ -35,11 +36,27 @@ func newUserStateTestServer(t *testing.T, u *mumble.User) (*Server, *connection.
 	clientSide, serverSide := net.Pipe()
 	c := connection.New(serverSide, nil, nil)
 	c.SetSessionID(u.SessionID)
+	c.SetSessionGeneration(u.SessionGeneration)
 	c.SetActive()
 
 	s := &Server{
 		users: users,
 		conns: map[uint32]*connection.Conn{u.SessionID: c},
+	}
+	s.registry = cluster.NewRegistry()
+	if err := s.registry.RegisterEdge(cluster.LocalEdgeID, 1); err != nil {
+		t.Fatal(err)
+	}
+	s.control = cluster.NewControlTransport(s.registry)
+	ref := cluster.SessionRef{SessionID: u.SessionID, Generation: u.SessionGeneration}
+	if err := s.registry.Bind(ref, cluster.LocalEdgeID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.control.BeginSync(ref, controlSink{conn: c}, controlDeferredLimit); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.control.CommitSync(context.Background(), ref); err != nil {
+		t.Fatal(err)
 	}
 	// Same content policy NewServer would install from the murmur defaults.
 	s.SetContentPolicy(true, 5000, 131072)
@@ -94,6 +111,7 @@ func connectTestUser(t *testing.T, srv *Server, u *mumble.User) (*connection.Con
 	clientSide, serverSide := net.Pipe()
 	c := connection.New(serverSide, nil, nil)
 	c.SetSessionID(u.SessionID)
+	c.SetSessionGeneration(u.SessionGeneration)
 	c.SetActive()
 	srv.RegisterConn(u.SessionID, c)
 
@@ -104,6 +122,38 @@ func connectTestUser(t *testing.T, srv *Server, u *mumble.User) (*connection.Con
 		_ = clientSide.Close()
 	})
 	return c, clientSide
+}
+
+// connectSyncingTestUser connects a user left in the Syncing lifecycle, the
+// way handleAuthenticate does before its initial sync. Callers run sendSync
+// and CommitSync themselves.
+func connectSyncingTestUser(t *testing.T, srv *Server, u *mumble.User) (*connection.Conn, net.Conn, cluster.SessionRef) {
+	t.Helper()
+	stored, ok := srv.users.Add(*u)
+	if !ok {
+		t.Fatalf("could not add user %s", u.Name)
+	}
+	*u = stored
+	clientSide, serverSide := net.Pipe()
+	c := connection.New(serverSide, nil, nil)
+	c.SetSessionID(u.SessionID)
+	c.SetSessionGeneration(u.SessionGeneration)
+	c.SetSessionGeneration(u.SessionGeneration)
+	c.SetUserName(u.Name)
+	ref := cluster.SessionRef{SessionID: u.SessionID, Generation: u.SessionGeneration}
+	if err := srv.registry.Bind(ref, cluster.LocalEdgeID); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.control.BeginSync(ref, controlSink{conn: c}, controlDeferredLimit); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { _ = c.Run(ctx, protocol.HandlerTable{}) }()
+	t.Cleanup(func() {
+		cancel()
+		_ = clientSide.Close()
+	})
+	return c, clientSide, ref
 }
 
 // addTestUser registers a user with srv without giving it a socket, for victims of
@@ -850,7 +900,7 @@ func TestHandleUserState_PluginOnlyDoesNotBroadcast(t *testing.T) {
 func TestHandleUserState_RecordingAnnouncementSkippedForModernClients(t *testing.T) {
 	u := &mumble.User{Name: "modern"}
 	s, c, clientSide := newUserStateTestServer(t, u)
-	c.SetClientVersion(version1_2_3)
+	s.users.UpdateUser(u.SessionID, func(rec *mumble.User) { rec.ClientVersion = version1_2_3 })
 
 	payload := marshalUserState(t, &messages.UserState{
 		Recording: true,
@@ -872,7 +922,7 @@ func TestHandleUserState_RecordingAnnouncementSkippedForModernClients(t *testing
 func TestHandleUserState_RecordingAnnouncementSentToLegacyClients(t *testing.T) {
 	u := &mumble.User{Name: "legacy"}
 	s, c, clientSide := newUserStateTestServer(t, u)
-	c.SetClientVersion(version1_2_3 - 1)
+	s.users.UpdateUser(u.SessionID, func(rec *mumble.User) { rec.ClientVersion = version1_2_3 - 1 })
 
 	payload := marshalUserState(t, &messages.UserState{
 		Recording: true,

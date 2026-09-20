@@ -1,20 +1,27 @@
 package audio
 
 import (
+	"github.com/dchote/go-mumble-server/internal/cluster"
 	ma "github.com/dchote/go-mumble-server/pkg/mumble/audio"
 	"log/slog"
 	"sync"
 	"sync/atomic"
 )
 
-type RecipientSender interface {
-	SendAudio(sessionID uint32, delivery ma.Delivery, cache *ma.EncodingCache) error
+type Recipient struct {
+	SessionID uint32
+	Session   cluster.SessionRef
+	Delivery  ma.Delivery
+}
+type BatchSender interface {
+	SendVoice(sender cluster.SessionRef, frame ma.Frame, recipients []Recipient) error
 }
 type RouterConfig struct {
-	Sender               RecipientSender
+	Sender               BatchSender
 	GetChan              func(uint32) uint32
 	GetUsersInChan       func(uint32) []uint32
-	RouteVoiceTarget     func(uint32, uint8, ma.Frame, *ma.EncodingCache) error
+	ResolveVoiceTarget   func(uint32, uint8, ma.Frame) []Recipient
+	ResolveSession       func(uint32) (cluster.SessionRef, bool)
 	GetLinkedChans       func(uint32) []uint32
 	GetListenersInChan   func(uint32) []uint32
 	GetListenerVolume    func(uint32, uint32) float32
@@ -42,19 +49,34 @@ func (r *Router) Route(sender uint32, frame ma.Frame) error {
 	r.mu.RLock()
 	cfg := r.config
 	r.mu.RUnlock()
+	ref := cluster.SessionRef{SessionID: sender}
+	if cfg.ResolveSession != nil {
+		var ok bool
+		ref, ok = cfg.ResolveSession(sender)
+		if !ok {
+			return nil
+		}
+	}
+	return r.RouteRef(ref, frame)
+}
+
+func (r *Router) RouteRef(senderRef cluster.SessionRef, frame ma.Frame) error {
+	sender := senderRef.SessionID
+	r.mu.RLock()
+	cfg := r.config
+	r.mu.RUnlock()
 	if cfg.Sender == nil || frame.Target > 31 {
 		return nil
 	}
 	frame.SenderSession = sender
-	cache := ma.NewEncodingCache()
 	if frame.Target > 0 && frame.Target < 31 {
-		if cfg.RouteVoiceTarget != nil {
-			return cfg.RouteVoiceTarget(sender, uint8(frame.Target), frame, cache)
+		if cfg.ResolveVoiceTarget != nil {
+			return cfg.Sender.SendVoice(senderRef, frame, cfg.ResolveVoiceTarget(sender, uint8(frame.Target), frame))
 		}
 		return nil
 	}
 	if frame.Target == 31 {
-		return cfg.Sender.SendAudio(sender, ma.Delivery{Frame: frame}, cache)
+		return cfg.Sender.SendVoice(senderRef, frame, []Recipient{{SessionID: sender, Session: senderRef, Delivery: ma.Delivery{Frame: frame}}})
 	}
 	if cfg.CanSenderSpeak != nil && !cfg.CanSenderSpeak(sender) {
 		return nil
@@ -95,12 +117,22 @@ func (r *Router) Route(sender uint32, frame ma.Frame) error {
 			}
 		}
 	}
+	canonical := make([]Recipient, 0, len(recipients))
 	for sid, d := range recipients {
-		_ = cfg.Sender.SendAudio(sid, d, cache)
+		ref := cluster.SessionRef{SessionID: sid}
+		if cfg.ResolveSession != nil {
+			var ok bool
+			ref, ok = cfg.ResolveSession(sid)
+			if !ok {
+				continue
+			}
+		}
+		canonical = append(canonical, Recipient{SessionID: sid, Session: ref, Delivery: d})
 	}
+	_ = cfg.Sender.SendVoice(senderRef, frame, canonical)
 	n := routeLogCount.Add(1)
 	if cfg.VoiceDebug && (n <= 5 || n%50 == 0) {
-		slog.Info("audio route", "sender", sender, "recipients", len(recipients), "encoding_groups", cache.Groups())
+		slog.Info("audio route", "sender", sender, "recipients", len(recipients))
 	}
 
 	return nil

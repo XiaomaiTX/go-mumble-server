@@ -19,6 +19,7 @@ import (
 	"github.com/dchote/go-mumble-server/internal/auth"
 	"github.com/dchote/go-mumble-server/internal/ban"
 	"github.com/dchote/go-mumble-server/internal/channel"
+	"github.com/dchote/go-mumble-server/internal/cluster"
 	"github.com/dchote/go-mumble-server/internal/config"
 	"github.com/dchote/go-mumble-server/internal/connection"
 	"github.com/dchote/go-mumble-server/internal/identity"
@@ -42,8 +43,8 @@ type Server struct {
 	table           protocol.HandlerTable
 	connMu          sync.RWMutex
 	conns           map[uint32]*connection.Conn
-	addrBySession   sync.Map // session -> net.Addr
-	sessionByAddr   sync.Map // addr.String() -> uint32 sessionID
+	addrBySession   sync.Map // SessionRef -> net.Addr
+	sessionByAddr   sync.Map // addr.String() -> SessionRef
 	voiceTargets    sync.Map // session -> map[targetID]voiceTargetSpec；由 connMu 保护更新
 	textRateLimiter sync.Map // session -> *rateWindow
 	// userStateRateLimiter throttles self-targeted UserState, which murmur also
@@ -54,6 +55,9 @@ type Server struct {
 	channelCryptoMu sync.RWMutex
 	channelCrypto   map[uint32]string // channelID -> "legacy"|"lite"|"secure"|"mixed"|""
 	router          *audio.Router
+	registry        *cluster.Registry
+	control         *cluster.ControlTransport
+	dispatcher      *cluster.Dispatcher
 	udpConn         net.PacketConn
 	voiceDebug      atomic.Bool
 	// Content policy, held separately from cfg so REST edits take effect without a
@@ -112,11 +116,12 @@ func (s *Server) HandleUDP(addr net.Addr, data []byte) {
 
 	// Primary path: look up session by cached address (set after first successful identification).
 	if cached, ok := s.sessionByAddr.Load(addrKey); ok {
-		sid := cached.(uint32)
+		cachedRef := cached.(cluster.SessionRef)
+		sid := cachedRef.SessionID
 		s.connMu.RLock()
 		c, cOk := s.conns[sid]
 		s.connMu.RUnlock()
-		if cOk && c.Crypt != nil && c.State() == connection.StateActive {
+		if cOk && c.SessionGeneration() == cachedRef.Generation && c.Crypt != nil && c.State() == connection.StateActive {
 			if err := c.Crypt.Decrypt(plain, data); err == nil {
 				senderSession = sid
 				senderCrypt = c.Crypt
@@ -197,10 +202,6 @@ func (s *Server) HandleUDP(addr net.Addr, data []byte) {
 			"addr", addrKey, "session", senderSession)
 	}
 
-	// Cache both directions of the address<->session mapping.
-	s.addrBySession.Store(senderSession, addr)
-	s.sessionByAddr.Store(addrKey, senderSession)
-
 	if len(plain) < 1 {
 		return
 	}
@@ -211,6 +212,15 @@ func (s *Server) HandleUDP(addr net.Addr, data []byte) {
 	if senderConn == nil || senderConn.Crypt != senderCrypt || senderConn.State() != connection.StateActive {
 		return
 	}
+	senderRef := cluster.SessionRef{SessionID: senderSession, Generation: senderConn.SessionGeneration()}
+	s.connMu.RLock()
+	if s.conns[senderSession] != senderConn || !s.registry.Active(senderRef) {
+		s.connMu.RUnlock()
+		return
+	}
+	s.addrBySession.Store(senderRef, addr)
+	s.sessionByAddr.Store(addrKey, senderRef)
+	s.connMu.RUnlock()
 	mode := senderConn.AudioWireMode()
 	if len(plain) > mumbleaudio.MaxPacketSize {
 		return
@@ -258,7 +268,7 @@ func (s *Server) HandleUDP(addr net.Addr, data []byte) {
 	if err != nil {
 		return
 	}
-	_ = s.router.Route(senderSession, frame)
+	_ = s.router.RouteRef(cluster.SessionRef{SessionID: senderSession, Generation: senderConn.SessionGeneration()}, frame)
 }
 
 // Audio 双格式实现已接入，控制通道默认宣告 1.5.0。
@@ -352,13 +362,30 @@ func appendProtoVarint(buf []byte, v uint64) []byte {
 	return append(buf, byte(v))
 }
 
-// SendAudio 根据接收连接的模式编码，UDP 和 TCP 回退共用同一明文。
-func (s *Server) SendAudio(sessionID uint32, d mumbleaudio.Delivery, cache *mumbleaudio.EncodingCache) error {
-	s.connMu.RLock()
-	c := s.conns[sessionID]
-	addr, _ := s.addrBySession.Load(sessionID)
-	s.connMu.RUnlock()
-	return s.sendDeliveryTo(sessionID, c, addr, d, cache)
+// SendVoice is the common canonical-recipient handoff used by normal voice,
+// VoiceTarget, listeners and loopback.
+func (s *Server) SendVoice(sender cluster.SessionRef, frame mumbleaudio.Frame, recipients []audio.Recipient) error {
+	senderSessionID := sender.SessionID
+	if !s.registry.Active(sender) {
+		return nil
+	}
+	batch := cluster.VoiceBatch{Sender: sender, Frame: frame, Recipients: make([]cluster.VoiceRecipient, 0, len(recipients))}
+	for _, recipient := range recipients {
+		ref := recipient.Session
+		if !s.registry.Active(ref) {
+			continue
+		}
+		d := recipient.Delivery
+		hasPosition := d.HasPosition
+		if hasPosition {
+			speaker, speakerOK := s.users.Snapshot(senderSessionID)
+			target, targetOK := s.users.Snapshot(recipient.SessionID)
+			hasPosition = speakerOK && targetOK && bytes.Equal(speaker.PluginContext, target.PluginContext)
+		}
+		batch.Recipients = append(batch.Recipients, cluster.VoiceRecipient{Session: ref, Context: d.Context, Volume: d.VolumeAdjustment, HasPosition: hasPosition})
+	}
+	s.dispatcher.DispatchVoice(context.Background(), batch)
+	return nil
 }
 func (s *Server) sendDeliveryTo(sessionID uint32, c *connection.Conn, addr interface{}, d mumbleaudio.Delivery, cache *mumbleaudio.EncodingCache) error {
 	if c == nil {
@@ -431,6 +458,10 @@ func (s *Server) sendAudioTo(sessionID uint32, c *connection.Conn, recipientAddr
 }
 
 func (s *Server) canSenderSpeak(sessionID uint32) bool {
+	ref, active := s.registry.Ref(sessionID)
+	if !active || !s.registry.Active(ref) {
+		return false
+	}
 	g, ok := s.users.SpeakGateFor(sessionID)
 	if !ok {
 		return false
@@ -450,6 +481,10 @@ func (s *Server) canSenderSpeakInChannel(sessionID, channelID uint32) bool {
 }
 
 func (s *Server) audioFilterRecipient(senderSessionID, recipientSessionID uint32) bool {
+	ref, active := s.registry.Ref(recipientSessionID)
+	if !active || !s.registry.Active(ref) {
+		return false
+	}
 	vs, ok := s.users.VoiceState(recipientSessionID)
 	if !ok {
 		return false
@@ -460,15 +495,13 @@ func (s *Server) audioFilterRecipient(senderSessionID, recipientSessionID uint32
 // UpdateChannelCrypto recomputes the aggregate crypto mode string for a channel.
 // Must be called whenever the channel's user set changes (join, leave, move, disconnect).
 func (s *Server) UpdateChannelCrypto(channelID uint32) {
-	sessions := s.users.SessionIDsInChannel(channelID)
-	modes := make(map[crypto.Mode]bool)
-	s.connMu.RLock()
-	for _, sid := range sessions {
-		if c, ok := s.conns[sid]; ok && c.Crypt != nil {
-			modes[c.Crypt.Mode()] = true
+	users := s.users.SnapshotByChannel(channelID)
+	modes := make(map[string]bool)
+	for _, u := range users {
+		if u.CryptoMode != "" {
+			modes[u.CryptoMode] = true
 		}
 	}
-	s.connMu.RUnlock()
 
 	var mode string
 	switch len(modes) {
@@ -476,7 +509,7 @@ func (s *Server) UpdateChannelCrypto(channelID uint32) {
 		mode = ""
 	case 1:
 		for m := range modes {
-			mode = cryptoModeString(m)
+			mode = m
 		}
 	default:
 		mode = "mixed"
@@ -536,6 +569,8 @@ func NewServer(cfg *config.Config, db *gorm.DB, serverID uint, udpConn net.Packe
 	users := user.NewManager(db, cfg.MaxUsers)
 	chans := channel.NewManager(db, serverID)
 	_ = acl.EnsureDefaultRootACLs(db, serverID)
+	registry := cluster.NewRegistry()
+	_ = registry.RegisterEdge(cluster.LocalEdgeID, 1)
 	s := &Server{
 		cfg:           cfg,
 		db:            db,
@@ -547,7 +582,11 @@ func NewServer(cfg *config.Config, db *gorm.DB, serverID uint, udpConn net.Packe
 		conns:         make(map[uint32]*connection.Conn),
 		channelCrypto: make(map[uint32]string),
 		udpConn:       udpConn,
+		registry:      registry,
 	}
+	s.dispatcher = cluster.NewDispatcher(registry)
+	s.dispatcher.RegisterVoiceTransport(cluster.LocalEdgeID, localVoiceTransport{s: s})
+	s.control = cluster.NewControlTransport(registry)
 	if strings.EqualFold(cfg.AuthMode, "external") {
 		s.authority, s.authorityErr = identity.NewExternalHTTPAuthority(identity.ExternalHTTPConfig{
 			BaseURL: cfg.ExternalAuthURL, ServiceToken: cfg.ExternalAuthServiceToken,
@@ -573,7 +612,8 @@ func NewServer(cfg *config.Config, db *gorm.DB, serverID uint, udpConn net.Packe
 		GetUsersInChan:     s.users.SessionIDsInChannel,
 		GetListenersInChan: s.listeners.SessionIDsIn,
 		GetListenerVolume:  s.listeners.Volume,
-		RouteVoiceTarget:   s.routeVoiceTarget,
+		ResolveVoiceTarget: s.resolveVoiceTargetCanonical,
+		ResolveSession:     s.registry.Ref,
 		GetLinkedChans: func(cid uint32) []uint32 {
 			ids := s.chans.ConnectedChannelIDs(cid)
 			out := make([]uint32, 0, len(ids))
@@ -594,23 +634,28 @@ func NewServer(cfg *config.Config, db *gorm.DB, serverID uint, udpConn net.Packe
 }
 
 func (s *Server) registerHandlers() {
+	// Local Edge entries: version/wire-mode negotiation, authentication (runs
+	// the CryptSetup handshake) and UDP tunnel audio decode keep the raw
+	// *connection.Conn because they are edge-local by protocol ownership.
 	s.table[protocol.MessageVersion] = s.handleVersion
 	s.table[protocol.MessageAuthenticate] = s.handleAuthenticate
-	s.table[protocol.MessagePing] = s.handlePing
-	s.table[protocol.MessageUserRemove] = s.handleUserRemove
-	s.table[protocol.MessageUserState] = s.handleUserState
+	// Ping terminates at the Local Edge (connection.Conn) and never reaches
+	// this table; only the TCP latency metric is reported to Core.
 	s.table[protocol.MessageCryptSetup] = s.handleCryptSetup
-	s.table[protocol.MessageChannelState] = s.handleChannelState
-	s.table[protocol.MessageChannelRemove] = s.handleChannelRemove
-	s.table[protocol.MessageTextMessage] = s.handleTextMessage
-	s.table[protocol.MessageVoiceTarget] = s.handleVoiceTarget
 	s.table[protocol.MessageUDPTunnel] = s.handleUDPTunnel
-	s.table[protocol.MessageBanList] = s.handleBanList
-	s.table[protocol.MessageACL] = s.handleACL
-	s.table[protocol.MessagePermissionQuery] = s.handlePermissionQuery
-	s.table[protocol.MessageRequestBlob] = s.handleRequestBlob
-	s.table[protocol.MessageUserStats] = s.handleUserStats
-	s.table[protocol.MessageQueryUsers] = s.handleQueryUsers
+	// Core control handlers go through the typed Peer adapter.
+	s.table[protocol.MessageUserRemove] = s.peerAdapt(s.handleUserRemove)
+	s.table[protocol.MessageUserState] = s.peerAdapt(s.handleUserState)
+	s.table[protocol.MessageChannelState] = s.peerAdapt(s.handleChannelState)
+	s.table[protocol.MessageChannelRemove] = s.peerAdapt(s.handleChannelRemove)
+	s.table[protocol.MessageTextMessage] = s.peerAdapt(s.handleTextMessage)
+	s.table[protocol.MessageVoiceTarget] = s.peerAdapt(s.handleVoiceTarget)
+	s.table[protocol.MessageBanList] = s.peerAdapt(s.handleBanList)
+	s.table[protocol.MessageACL] = s.peerAdapt(s.handleACL)
+	s.table[protocol.MessagePermissionQuery] = s.peerAdapt(s.handlePermissionQuery)
+	s.table[protocol.MessageRequestBlob] = s.peerAdapt(s.handleRequestBlob)
+	s.table[protocol.MessageUserStats] = s.peerAdapt(s.handleUserStats)
+	s.table[protocol.MessageQueryUsers] = s.peerAdapt(s.handleQueryUsers)
 	s.table[protocol.MessageUserList] = s.handleUserList
 	s.table[protocol.MessageContextActionModify] = s.handleContextActionModify
 	s.table[protocol.MessageContextAction] = s.handleContextAction
@@ -681,7 +726,7 @@ func (s *Server) RefreshEnterStates() {
 	channels := s.chans.GetTree()
 	restricted := s.enterRestrictedChannels()
 	for _, u := range s.users.SnapshotAll() {
-		s.refreshEnterStatesFor(u, s.conn(u.SessionID), channels, restricted)
+		s.refreshEnterStatesFor(u, channels, restricted)
 	}
 }
 
@@ -695,16 +740,20 @@ func (s *Server) RefreshEnterStatesFor(sessionID uint32) {
 	if !ok {
 		return
 	}
-	s.refreshEnterStatesFor(u, s.conn(sessionID), s.chans.GetTree(), s.enterRestrictedChannels())
+	s.refreshEnterStatesFor(u, s.chans.GetTree(), s.enterRestrictedChannels())
 }
 
-func (s *Server) refreshEnterStatesFor(u mumble.User, c *connection.Conn, channels []*mumble.Channel, restricted map[uint32]bool) {
-	if c == nil || c.State() != connection.StateActive {
+func (s *Server) refreshEnterStatesFor(u mumble.User, channels []*mumble.Channel, restricted map[uint32]bool) {
+	ref, ok := s.registry.Ref(u.SessionID)
+	if !ok {
 		return
 	}
 	subject := acl.SubjectOf(u)
 	for _, ch := range channels {
-		_ = c.WriteMessage(protocol.MessageChannelState, s.channelToStateFor(ch, subject, restricted[ch.ID]))
+		_ = s.control.Send(ref, cluster.ControlMessage{
+			Type:    protocol.MessageChannelState,
+			Message: s.channelToStateFor(ch, subject, restricted[ch.ID]),
+		})
 	}
 }
 
@@ -829,7 +878,11 @@ func (s *Server) BanManager() *ban.Manager {
 // HasUDPAddress returns true if the session has sent at least one UDP packet (voice or ping),
 // indicating the client is using native UDP transport rather than TCP tunnel.
 func (s *Server) HasUDPAddress(sessionID uint32) bool {
-	_, ok := s.addrBySession.Load(sessionID)
+	ref, found := s.registry.Ref(sessionID)
+	if !found {
+		return false
+	}
+	_, ok := s.addrBySession.Load(ref)
 	return ok
 }
 
@@ -849,10 +902,18 @@ func (s *Server) BroadcastChannelState(ch *mumble.Channel) {
 		return
 	}
 	restricted := s.enterRestrictedChannels()[ch.ID]
-	for _, u := range s.users.SnapshotAll() {
-		if c := s.conn(u.SessionID); c != nil && c.State() == connection.StateActive {
-			_ = c.WriteMessage(protocol.MessageChannelState, s.channelToStateFor(ch, acl.SubjectOf(u), restricted))
+	for _, snap := range s.registry.Sessions() {
+		if !deliverableState(snap.State) {
+			continue
 		}
+		u, ok := s.users.Snapshot(snap.Ref.SessionID)
+		if !ok {
+			continue
+		}
+		_ = s.control.Send(snap.Ref, cluster.ControlMessage{
+			Type:    protocol.MessageChannelState,
+			Message: s.channelToStateFor(ch, acl.SubjectOf(u), restricted),
+		})
 	}
 }
 
@@ -861,33 +922,76 @@ func (s *Server) BroadcastChannelRemove(channelID uint32) {
 	s.Broadcast(0, protocol.MessageChannelRemove, &messages.ChannelRemove{ChannelID: channelID})
 }
 
+// registerConnOnly maps a connection for control/UDP routing without any
+// lifecycle action. The authentication path owns the session lifecycle (Bind
+// and BeginSync ran before sendSync) and must never resurrect a session that
+// disconnect cleanup has already closed: re-binding here would re-announce a
+// ghost and block session-ID reuse.
+func (s *Server) registerConnOnly(sessionID uint32, c *connection.Conn) {
+	s.connMu.Lock()
+	s.conns[sessionID] = c
+	s.connMu.Unlock()
+}
+
 // RegisterConn registers a connection for broadcasting.
 func (s *Server) RegisterConn(sessionID uint32, c *connection.Conn) {
 	s.connMu.Lock()
-	defer s.connMu.Unlock()
 	s.conns[sessionID] = c
+	s.connMu.Unlock()
+	// Compatibility for test/local callers that register an already-created
+	// user directly. The authentication path binds Syncing before this call and
+	// drives its own barrier, so only pre-registered conns take this path.
+	if _, exists := s.registry.Ref(sessionID); !exists {
+		if u, ok := s.users.Snapshot(sessionID); ok {
+			c.SetSessionGeneration(u.SessionGeneration)
+			ref := cluster.SessionRef{SessionID: sessionID, Generation: u.SessionGeneration}
+			if s.registry.Bind(ref, cluster.LocalEdgeID) == nil {
+				if s.control.BeginSync(ref, controlSink{conn: c}, controlDeferredLimit) == nil {
+					_ = s.control.CommitSyncAndAnnounce(context.Background(), ref, func() {})
+				} else {
+					_ = s.registry.Unbind(ref)
+				}
+			}
+		}
+	}
 }
 
-// UnregisterConn removes a connection. Callers must call UpdateChannelCrypto for the
-// user's channel after removing the user (UnregisterConn cannot see the user if
-// callers remove first).
-func (s *Server) UnregisterConn(sessionID uint32) {
-	if a, ok := s.addrBySession.Load(sessionID); ok {
-		s.sessionByAddr.Delete(a.(net.Addr).String())
+// UnregisterConn tears down a session's bindings and reports whether the
+// session was ever announced to other clients; a never-announced session must
+// not produce a UserRemove broadcast. Generation-aware: a stale SessionRef
+// (its ID already reused by a newer logical session) touches nothing — a
+// delayed disconnect must never clean up its successor. Callers must call
+// UpdateChannelCrypto for the user's channel after removing the user
+// (UnregisterConn cannot see the user if callers remove first).
+func (s *Server) UnregisterConn(ref cluster.SessionRef) bool {
+	if !ref.Valid() {
+		return false
 	}
-	s.connMu.Lock()
-	delete(s.conns, sessionID)
-	s.removeVoiceTargetsLocked(sessionID)
-	s.connMu.Unlock()
-	s.addrBySession.Delete(sessionID)
-	s.textRateLimiter.Delete(sessionID)
-	s.userStateRateLimiter.Delete(sessionID)
-	// Listener state dies with the session (no persistence); the UserRemove
-	// broadcast that follows already implies its listening list is gone.
-	s.listeners.RemoveAllFor(sessionID)
+	announced := false
+	_ = s.registry.CloseAndUnbind(ref, func(snap cluster.SessionSnapshot) {
+		announced = snap.Announced
+		// Detach the control queue without closing the socket: connection
+		// teardown is owned by SendThenClose, the read loop exit, or the
+		// caller's own cleanup.
+		s.control.Detach(ref)
+		if a, ok := s.addrBySession.Load(ref); ok {
+			s.sessionByAddr.CompareAndDelete(a.(net.Addr).String(), ref)
+		}
+		s.connMu.Lock()
+		delete(s.conns, ref.SessionID)
+		s.removeVoiceTargetsLocked(ref.SessionID)
+		s.connMu.Unlock()
+		s.addrBySession.Delete(ref)
+		s.textRateLimiter.Delete(ref.SessionID)
+		s.userStateRateLimiter.Delete(ref.SessionID)
+		// Listener state dies with the session (no persistence); the UserRemove
+		// broadcast that follows already implies its listening list is gone.
+		s.listeners.RemoveAllFor(ref.SessionID)
+	})
 	s.chans.CleanEmptyTempChannels(func(cid uint32) bool {
 		return s.users.CountInChannel(cid) > 0
 	})
+	return announced
 }
 
 // KickSession kicks a user (server-initiated, e.g. from REST API). Actor 0 = server.
@@ -897,16 +1001,16 @@ func (s *Server) KickSession(sessionID uint32, reason string) bool {
 		return false
 	}
 	channelID := u.ChannelID
-	targetConn := s.conn(sessionID)
 	ur := &messages.UserRemove{Session: sessionID, Actor: 0, Reason: reason, Ban: false}
-	s.Broadcast(0, protocol.MessageUserRemove, ur)
-	s.users.Remove(sessionID)
-	s.UnregisterConn(sessionID)
+	ref := cluster.SessionRef{SessionID: sessionID, Generation: u.SessionGeneration}
+	if s.beginCloseAnnounced(sessionID, u.SessionGeneration) {
+		s.Broadcast(sessionID, protocol.MessageUserRemove, ur)
+	}
+	s.sendThenClose(ref, protocol.MessageUserRemove, ur)
+	s.users.RemoveIfGeneration(sessionID, u.SessionGeneration)
+	s.UnregisterConn(ref)
 	if channelID != 0 {
 		s.UpdateChannelCrypto(channelID)
-	}
-	if targetConn != nil {
-		targetConn.CloseAfterFlush()
 	}
 	slog.Info("User kicked via REST", "session", sessionID, "name", u.Name, "reason", reason)
 	return true
@@ -965,59 +1069,91 @@ func banEntryByIP(name, reason string, ip net.IP) messages.BanEntry {
 	return be
 }
 
+// appendSessionBan derives ban entries from Core user metadata — the stored
+// address first, the local edge transport as fallback — so protocol- and
+// REST-initiated bans behave identically for sessions without a local conn
+// (remote edge sessions). Cert-hash bans survive IP changes; otherwise the
+// address is banned.
+func (s *Server) appendSessionBan(existing []messages.BanEntry, u mumble.User, reason string) []messages.BanEntry {
+	var ip net.IP
+	if u.Address != "" {
+		ip = net.ParseIP(u.Address)
+	}
+	if ip == nil {
+		if c := s.conn(u.SessionID); c != nil {
+			if addr := c.RemoteAddr(); addr != nil {
+				if host, _, err := net.SplitHostPort(addr.String()); err == nil {
+					ip = net.ParseIP(host)
+				}
+			}
+		}
+	}
+	if u.CertHash != "" {
+		return append(existing, banEntryByCert(u.Name, reason, u.CertHash))
+	}
+	if ip != nil {
+		return append(existing, banEntryByIP(u.Name, reason, ip))
+	}
+	return existing
+}
+
 // BanAndKickSession bans the user by IP and kicks them.
 func (s *Server) BanAndKickSession(sessionID uint32, reason string) bool {
 	u, ok := s.users.Snapshot(sessionID)
 	if !ok {
 		return false
 	}
-	targetConn := s.conn(sessionID)
-	var ip net.IP
-	if u.Address != "" {
-		ip = net.ParseIP(u.Address)
-	}
-	if ip == nil && targetConn != nil {
-		if addr := targetConn.RemoteAddr(); addr != nil {
-			if host, _, err := net.SplitHostPort(addr.String()); err == nil {
-				ip = net.ParseIP(host)
-			}
-		}
-	}
 	existing := s.bans.List()
-	// Ban by cert hash when available (persists across IP changes); otherwise by IP.
-	if u.CertHash != "" {
-		existing = append(existing, banEntryByCert(u.Name, reason, u.CertHash))
-		_ = s.bans.Replace(existing)
-	} else if ip != nil {
-		existing = append(existing, banEntryByIP(u.Name, reason, ip))
-		_ = s.bans.Replace(existing)
+	if updated := s.appendSessionBan(existing, u, reason); len(updated) != len(existing) {
+		_ = s.bans.Replace(updated)
 	}
 	channelID := u.ChannelID
 	ur := &messages.UserRemove{Session: sessionID, Actor: 0, Reason: reason, Ban: true}
-	s.Broadcast(0, protocol.MessageUserRemove, ur)
-	s.users.Remove(sessionID)
-	s.UnregisterConn(sessionID)
+	ref := cluster.SessionRef{SessionID: sessionID, Generation: u.SessionGeneration}
+	if s.beginCloseAnnounced(sessionID, u.SessionGeneration) {
+		s.Broadcast(sessionID, protocol.MessageUserRemove, ur)
+	}
+	s.sendThenClose(ref, protocol.MessageUserRemove, ur)
+	s.users.RemoveIfGeneration(sessionID, u.SessionGeneration)
+	s.UnregisterConn(ref)
 	if channelID != 0 {
 		s.UpdateChannelCrypto(channelID)
-	}
-	if targetConn != nil {
-		targetConn.CloseAfterFlush()
 	}
 	slog.Info("User banned and kicked via REST", "session", sessionID, "name", u.Name, "reason", reason)
 	return true
 }
 
-// Broadcast sends a message to all connections except skipSession.
+// Broadcast sends a message to every live session except skipSession. Active
+// sessions receive immediately through the per-session FIFO; Syncing sessions
+// get the message deferred by the transport until their initial sync commits,
+// so no state change is lost across the snapshot race (plan 0014 §四.2.3).
 func (s *Server) Broadcast(skipSession uint32, msgType protocol.MessageType, msg messages.Message) {
-	s.connMu.RLock()
-	defer s.connMu.RUnlock()
-	for sid, c := range s.conns {
-		if sid != skipSession {
-			_ = c.WriteMessage(msgType, msg)
+	for _, snap := range s.registry.Sessions() {
+		if snap.Ref.SessionID == skipSession || !deliverableState(snap.State) {
+			continue
 		}
+		_ = s.control.Send(snap.Ref, cluster.ControlMessage{Type: msgType, Message: msg})
 	}
 }
 
+// sendControl delivers a per-session control message through the same FIFO as
+// Broadcast: immediate when Active, deferred while Syncing, dropped otherwise.
+func (s *Server) sendControl(sessionID uint32, msgType protocol.MessageType, msg messages.Message) {
+	ref, ok := s.registry.Ref(sessionID)
+	if !ok {
+		return
+	}
+	_ = s.control.Send(ref, cluster.ControlMessage{Type: msgType, Message: msg})
+}
+
+// deliverableState reports whether a session may receive ordinary control
+// traffic now (Active) or once its sync commits (Syncing).
+func deliverableState(state cluster.SessionState) bool {
+	return state == cluster.StateActive || state == cluster.StateSyncing
+}
+
+// handleVersion is a Local Edge entry: audio wire-mode negotiation is
+// edge-owned transport state and must never move onto the Peer interface.
 func (s *Server) handleVersion(msgType protocol.MessageType, payload []byte, ctx interface{}) error {
 	c := ctx.(*connection.Conn)
 	if len(payload) > 0 {
@@ -1052,6 +1188,9 @@ func clientVersionFull(v messages.Version) uint64 {
 	return 0
 }
 
+// handleAuthenticate is a Local Edge entry: it collects the client certificate
+// and remote address, runs the CryptSetup handshake, and only then hands the
+// logical session to Core (registry + control transport).
 func (s *Server) handleAuthenticate(msgType protocol.MessageType, payload []byte, ctx interface{}) error {
 	c := ctx.(*connection.Conn)
 	var authMsg messages.Authenticate
@@ -1124,6 +1263,10 @@ func (s *Server) handleAuthenticate(msgType protocol.MessageType, payload []byte
 		PolicyVersion:           resolved.PolicyVersion,
 		IdentityLastValidatedAt: time.Now(),
 		IsSuperUser:             resolved.IsSuperUser,
+		// Core-owned copy of the split-owned client metadata the edge collected
+		// from the Version message; Core business decisions (e.g. the legacy
+		// recording announcement) read this, never the edge connection.
+		ClientVersion: c.ClientVersion(),
 	}
 	if addr != nil {
 		if host, _, err := net.SplitHostPort(addr.String()); err == nil {
@@ -1139,14 +1282,36 @@ func (s *Server) handleAuthenticate(msgType protocol.MessageType, payload []byte
 		return s.sendReject(c, messages.RejectServerFull, "Server full")
 	}
 	c.SetSessionID(stored.SessionID)
+	c.SetSessionGeneration(stored.SessionGeneration)
 	c.SetUserName(stored.Name)
-	c.SetActive()
+	ref := cluster.SessionRef{SessionID: stored.SessionID, Generation: stored.SessionGeneration}
+	if err := s.registry.Bind(ref, cluster.LocalEdgeID); err != nil {
+		s.users.RemoveIfGeneration(stored.SessionID, stored.SessionGeneration)
+		return s.sendReject(c, messages.RejectAuthenticatorFail, "Session setup failed")
+	}
+	if err := s.control.BeginSync(ref, controlSink{conn: c}, controlDeferredLimit); err != nil {
+		_, _ = s.registry.BeginClose(ref)
+		_ = s.registry.Unbind(ref)
+		s.users.RemoveIfGeneration(stored.SessionID, stored.SessionGeneration)
+		return s.sendReject(c, messages.RejectAuthenticatorFail, "Session setup failed")
+	}
 	// This session brings its own access tokens and channel, both of which feed
 	// group resolution, so anything cached for this account is now suspect.
 	s.invalidateACLCache()
-	s.sendSync(c, stored)
+	if err := s.sendSync(c, stored, ref); err != nil {
+		s.closeFailedSync(ref)
+		return err
+	}
+	// CommitSync confirms the ServerConfig write receipt, splices the deferred
+	// queue ahead of new broadcasts and commits the registry to Active.
+	if err := s.control.CommitSyncAndAnnounce(context.Background(), ref, func() {
+		c.SetActive()
+		s.Broadcast(stored.SessionID, protocol.MessageUserState, userToState(stored))
+	}); err != nil {
+		s.closeFailedSync(ref)
+		return err
+	}
 	s.UpdateChannelCrypto(stored.ChannelID)
-	s.Broadcast(stored.SessionID, protocol.MessageUserState, userToState(stored))
 	slog.Info("Mumble client authenticated", "user", stored.Name, "session", stored.SessionID, "channel", stored.ChannelID)
 	return nil
 }
@@ -1216,14 +1381,16 @@ func sanitizedClientTokens(tokens []string) []string {
 }
 
 func (s *Server) sendReject(c *connection.Conn, typ messages.RejectType, reason string) error {
-	err := c.WriteMessage(protocol.MessageReject, &messages.Reject{Type: typ, Reason: reason})
+	writeErr := c.WriteMessage(protocol.MessageReject, &messages.Reject{Type: typ, Reason: reason})
 	// Murmur disconnects immediately after sending Reject (murmur/Messages.cpp:
 	// sendMessage(reject) then disconnectSocket()). Official clients raise the
 	// password retry prompt from the disconnect event, keyed on the reject type,
 	// so a rejected connection must not linger or the prompt fires at a random
-	// later moment (ping watchdog, manual disconnect, next reconnect).
+	// later moment (ping watchdog, manual disconnect, next reconnect). The
+	// flush-then-close is async because the writer only drains once the client
+	// reads the Reject; the pipe write receipt itself orders close after delivery.
 	go c.CloseAfterFlush()
-	return err
+	return writeErr
 }
 
 func cryptoModeString(mode crypto.Mode) string {
@@ -1263,7 +1430,11 @@ func (s *Server) negotiateCryptoMode(c *connection.Conn) crypto.Mode {
 	return crypto.ModeLegacy
 }
 
-func (s *Server) sendSync(c *connection.Conn, u mumble.User) {
+// sendSync performs the Local Edge CryptSetup and readiness, then streams the
+// Core-owned initial snapshot through the session's initial lane. The
+// client-visible order is unchanged: CryptSetup → CodecVersion → ChannelState
+// list → self UserState → Active roster → ServerSync → ServerConfig.
+func (s *Server) sendSync(c *connection.Conn, u mumble.User, ref cluster.SessionRef) error {
 	mode := s.negotiateCryptoMode(c)
 	if updated, ok := s.users.UpdateUser(u.SessionID, func(live *mumble.User) {
 		live.CryptoMode = cryptoModeString(mode)
@@ -1273,20 +1444,31 @@ func (s *Server) sendSync(c *connection.Conn, u mumble.User) {
 	c.Crypt = crypto.NewCryptState(mode)
 	key, encNonce, decNonce := s.generateCryptSetup(mode)
 	c.Crypt.SetKey(key, encNonce, decNonce)
-	_ = c.WriteMessage(protocol.MessageCryptSetup, &messages.CryptSetup{
+	if err := c.WriteMessage(protocol.MessageCryptSetup, &messages.CryptSetup{
 		Key:         key,
 		ClientNonce: decNonce, // server's decrypt nonce = client's encrypt nonce
 		ServerNonce: encNonce, // server's encrypt nonce = client's decrypt nonce
-	})
+	}); err != nil {
+		return err
+	}
 	// Register conn for UDP routing before rest of sync so HandleUDP can identify
 	// the sender when the client sends its first UDP packet (ping/voice) after CryptSetup.
-	s.RegisterConn(u.SessionID, c)
-	_ = c.WriteMessage(protocol.MessageCodecVersion, &messages.CodecVersion{Opus: true})
+	// Map-only: if disconnect cleanup already closed this session, the detached
+	// control queue makes the next SendInitial fail and aborts the sync.
+	s.registerConnOnly(u.SessionID, c)
+	initial := func(msgType protocol.MessageType, msg messages.Message) error {
+		return s.control.SendInitial(ref, cluster.ControlMessage{Type: msgType, Message: msg})
+	}
+	if err := initial(protocol.MessageCodecVersion, &messages.CodecVersion{Opus: true}); err != nil {
+		return err
+	}
 	restricted := s.enterRestrictedChannels()
 	subject := acl.SubjectOf(u)
 	for _, ch := range s.chans.GetTree() {
 		cs := s.channelToStateFor(ch, subject, restricted[ch.ID])
-		_ = c.WriteMessage(protocol.MessageChannelState, cs)
+		if err := initial(protocol.MessageChannelState, cs); err != nil {
+			return err
+		}
 	}
 	// Listening state rides the roster snapshots so a connecting client can render
 	// every user's monitored channels; volume adjustments stay owner-only, matching
@@ -1295,22 +1477,32 @@ func (s *Server) sendSync(c *connection.Conn, u mumble.User) {
 	selfState := userToState(u)
 	selfState.ListeningChannelAdd = s.listeners.ChannelsFor(u.SessionID)
 	selfState.ListeningVolumeAdjustment = s.listeners.ListeningVolumes(u.SessionID)
-	_ = c.WriteMessage(protocol.MessageUserState, selfState)
+	if err := initial(protocol.MessageUserState, selfState); err != nil {
+		return err
+	}
 	for _, ou := range s.users.SnapshotAll() {
 		if ou.SessionID != u.SessionID {
+			other := cluster.SessionRef{SessionID: ou.SessionID, Generation: ou.SessionGeneration}
+			if !s.registry.Active(other) {
+				continue
+			}
 			state := userToState(ou)
 			state.ListeningChannelAdd = s.listeners.ChannelsFor(ou.SessionID)
-			_ = c.WriteMessage(protocol.MessageUserState, state)
+			if err := initial(protocol.MessageUserState, state); err != nil {
+				return err
+			}
 		}
 	}
 	perms := uint64(s.aclPermissions(acl.SubjectOf(u), s.chans.RootID()))
-	_ = c.WriteMessage(protocol.MessageServerSync, &messages.ServerSync{
+	if err := initial(protocol.MessageServerSync, &messages.ServerSync{
 		Session:      u.SessionID,
 		MaxBandwidth: uint32(s.cfg.MaxBandwidth),
 		WelcomeText:  s.cfg.WelcomeText,
 		Permissions:  perms,
-	})
-	_ = c.WriteMessage(protocol.MessageServerConfig, &messages.ServerConfig{
+	}); err != nil {
+		return err
+	}
+	return initial(protocol.MessageServerConfig, &messages.ServerConfig{
 		MaxBandwidth:       uint32(s.cfg.MaxBandwidth),
 		WelcomeText:        s.cfg.WelcomeText,
 		AllowHTML:          true,
@@ -1428,33 +1620,8 @@ func userToState(u mumble.User) *messages.UserState {
 	return state
 }
 
-func (s *Server) handlePing(msgType protocol.MessageType, payload []byte, ctx interface{}) error {
-	c := ctx.(*connection.Conn)
-	resp := messages.Ping{}
-	if len(payload) > 0 {
-		var p messages.Ping
-		if err := p.Unmarshal(payload); err != nil {
-			return err
-		}
-		resp.Timestamp = p.Timestamp
-		if p.TCPPingAvg > 0 {
-			s.users.SetPing(c.SessionID(), p.TCPPingAvg)
-		}
-	}
-	if resp.Timestamp == 0 {
-		resp.Timestamp = uint64(time.Now().UnixMicro())
-	}
-	resp.Good = c.Crypt.Good
-	resp.Late = c.Crypt.Late
-	resp.Lost = c.Crypt.Lost
-	resp.Resync = c.Crypt.Resync
-	_ = c.WriteMessage(protocol.MessagePing, &resp)
-	return nil
-}
-
-func (s *Server) handleUserRemove(msgType protocol.MessageType, payload []byte, ctx interface{}) error {
-	c := ctx.(*connection.Conn)
-	if c.State() != connection.StateActive {
+func (s *Server) handleUserRemove(msgType protocol.MessageType, payload []byte, c Peer) error {
+	if !s.peerActive(c) {
 		return nil
 	}
 	var ur messages.UserRemove
@@ -1484,31 +1651,36 @@ func (s *Server) handleUserRemove(msgType protocol.MessageType, payload []byte, 
 		return nil
 	}
 	ur.Actor = c.SessionID()
-	targetConn := s.conn(ur.Session)
-	s.Broadcast(0, protocol.MessageUserRemove, &ur)
-	if ur.Ban && targetConn != nil {
-		var ip net.IP
-		if addr := targetConn.RemoteAddr(); addr != nil {
-			if host, _, err := net.SplitHostPort(addr.String()); err == nil {
-				ip = net.ParseIP(host)
-			}
-		}
-		if ip != nil {
-			existing := s.bans.List()
-			existing = append(existing, banEntryByIP(target.Name, ur.Reason, ip))
-			_ = s.bans.Replace(existing)
+	if ur.Ban {
+		existing := s.bans.List()
+		if updated := s.appendSessionBan(existing, target, ur.Reason); len(updated) != len(existing) {
+			_ = s.bans.Replace(updated)
 		}
 	}
 	channelID := target.ChannelID
-	s.users.Remove(ur.Session)
-	s.UnregisterConn(ur.Session)
+	targetRef := cluster.SessionRef{SessionID: ur.Session, Generation: target.SessionGeneration}
+	if s.beginCloseAnnounced(ur.Session, target.SessionGeneration) {
+		s.Broadcast(ur.Session, protocol.MessageUserRemove, &ur)
+	}
+	s.sendThenClose(targetRef, protocol.MessageUserRemove, &ur)
+	s.users.RemoveIfGeneration(ur.Session, target.SessionGeneration)
+	s.UnregisterConn(targetRef)
 	if channelID != 0 {
 		s.UpdateChannelCrypto(channelID)
 	}
-	if targetConn != nil {
-		targetConn.CloseAfterFlush()
-	}
 	return nil
+}
+
+// beginCloseAnnounced transitions a session toward Closing and reports whether
+// it was ever announced to other clients. The UserRemove broadcast is emitted
+// only when true: a victim still mid-sync was never seen by anybody, so its
+// removal must stay silent (plan 0014 §四.4).
+func (s *Server) beginCloseAnnounced(sessionID uint32, generation uint64) bool {
+	snap, err := s.registry.BeginClose(cluster.SessionRef{SessionID: sessionID, Generation: generation})
+	if err != nil {
+		return false
+	}
+	return snap.Announced
 }
 
 // selfOnlyUserStateFields are UserState fields a client may only set on itself.
@@ -1545,9 +1717,8 @@ const handledUserStateFields = broadcastUserStateFields | pluginUserStateFields
 // never a fresh snapshot: presence on this path means "this changed", and building
 // the broadcast from userToState was the v0.1.4 regression. See
 // docs/architecture/protocol-encoding.md for the full delta-vs-snapshot rule.
-func (s *Server) handleUserState(msgType protocol.MessageType, payload []byte, ctx interface{}) error {
-	c := ctx.(*connection.Conn)
-	if c.State() != connection.StateActive {
+func (s *Server) handleUserState(msgType protocol.MessageType, payload []byte, c Peer) error {
+	if !s.peerActive(c) {
 		return nil
 	}
 	var us messages.UserState
@@ -1698,11 +1869,10 @@ func (s *Server) handleUserState(msgType protocol.MessageType, payload []byte, c
 	// A client that starts recording on a server which forbids it is disconnected,
 	// not merely ignored (Messages.cpp:1057-1070).
 	if us.Has(messages.UserStateSetRecording) && us.Recording && !target.Recording && !s.recordingAllowed() {
-		_ = c.WriteMessage(protocol.MessageUserRemove, &messages.UserRemove{
+		s.sendThenClose(cluster.SessionRef{SessionID: targetSession, Generation: target.SessionGeneration}, protocol.MessageUserRemove, &messages.UserRemove{
 			Session: targetSession,
 			Reason:  "Recording is not allowed on this server",
 		})
-		c.CloseAfterFlush()
 		return nil
 	}
 
@@ -1752,14 +1922,14 @@ func (s *Server) handleUserState(msgType protocol.MessageType, payload []byte, c
 		s.invalidateACLCache()
 		s.UpdateChannelCrypto(oldChannelID)
 		s.UpdateChannelCrypto(us.ChannelID)
-		if targetConn := s.conn(targetSession); targetConn != nil {
-			if targetSession == c.SessionID() {
-				perms := s.aclPermissions(acl.SubjectOf(target), us.ChannelID)
-				_ = targetConn.WriteMessage(protocol.MessagePermissionQuery, &messages.PermissionQuery{
-					ChannelID:   us.ChannelID,
-					Permissions: uint32(perms),
-				})
-			}
+		if targetSession == c.SessionID() {
+			// Refresh the mover's own permission cache through the control
+			// transport FIFO, so remote sessions get it too (Messages.cpp:842).
+			perms := s.aclPermissions(acl.SubjectOf(target), us.ChannelID)
+			s.sendControl(targetSession, protocol.MessagePermissionQuery, &messages.PermissionQuery{
+				ChannelID:   us.ChannelID,
+				Permissions: uint32(perms),
+			})
 		}
 		// Resolved here, before UpdateUser — see maySpeak.
 		maySpeakAtDest = s.maySpeak(acl.SubjectOf(target), us.ChannelID)
@@ -1850,15 +2020,22 @@ func (s *Server) broadcastRecordingAnnouncement(name string, recording bool) {
 		text = fmt.Sprintf("User '%s' stopped recording", name)
 	}
 	tm := &messages.TextMessage{TreeID: []uint32{0}, Message: text}
-	s.connMu.RLock()
-	defer s.connMu.RUnlock()
-	for _, c := range s.conns {
-		if c.ClientVersion() < version1_2_3 {
-			_ = c.WriteMessage(protocol.MessageTextMessage, tm)
+	for _, snap := range s.registry.Sessions() {
+		if !deliverableState(snap.State) {
+			continue
 		}
+		// Version is Core-owned user metadata, so remote sessions without a
+		// local conn are filtered identically.
+		u, ok := s.users.Snapshot(snap.Ref.SessionID)
+		if !ok || u.SessionGeneration != snap.Ref.Generation || u.ClientVersion >= version1_2_3 {
+			continue
+		}
+		_ = s.control.Send(snap.Ref, cluster.ControlMessage{Type: protocol.MessageTextMessage, Message: tm})
 	}
 }
 
+// handleCryptSetup is a Local Edge entry: nonce resync reads the UDP crypto
+// state, which never crosses the Core/Edge boundary.
 func (s *Server) handleCryptSetup(msgType protocol.MessageType, payload []byte, ctx interface{}) error {
 	c := ctx.(*connection.Conn)
 	if c.Crypt == nil {
@@ -1882,9 +2059,8 @@ func (s *Server) handleCryptSetup(msgType protocol.MessageType, payload []byte, 
 	return nil
 }
 
-func (s *Server) handleChannelState(msgType protocol.MessageType, payload []byte, ctx interface{}) error {
-	c := ctx.(*connection.Conn)
-	if c.State() != connection.StateActive {
+func (s *Server) handleChannelState(msgType protocol.MessageType, payload []byte, c Peer) error {
+	if !s.peerActive(c) {
 		return nil
 	}
 	var cs messages.ChannelState
@@ -2010,9 +2186,8 @@ func (s *Server) handleChannelState(msgType protocol.MessageType, payload []byte
 	return nil
 }
 
-func (s *Server) handleChannelRemove(msgType protocol.MessageType, payload []byte, ctx interface{}) error {
-	c := ctx.(*connection.Conn)
-	if c.State() != connection.StateActive {
+func (s *Server) handleChannelRemove(msgType protocol.MessageType, payload []byte, c Peer) error {
+	if !s.peerActive(c) {
 		return nil
 	}
 	var cr messages.ChannelRemove
@@ -2082,9 +2257,8 @@ func (s *Server) handleChannelRemove(msgType protocol.MessageType, payload []byt
 	return nil
 }
 
-func (s *Server) handleTextMessage(msgType protocol.MessageType, payload []byte, ctx interface{}) error {
-	c := ctx.(*connection.Conn)
-	if c.State() != connection.StateActive {
+func (s *Server) handleTextMessage(msgType protocol.MessageType, payload []byte, c Peer) error {
+	if !s.peerActive(c) {
 		return nil
 	}
 	var tm messages.TextMessage
@@ -2158,15 +2332,11 @@ func (s *Server) handleTextMessage(msgType protocol.MessageType, payload []byte,
 	senderSession := c.SessionID()
 	seen := make(map[uint32]bool)
 	for _, sid := range recipients {
-		if sid == senderSession {
+		if sid == senderSession || seen[sid] {
 			continue
 		}
-		if !seen[sid] {
-			seen[sid] = true
-			if conn := s.conn(sid); conn != nil {
-				_ = conn.WriteMessage(protocol.MessageTextMessage, &tm)
-			}
-		}
+		seen[sid] = true
+		s.sendControl(sid, protocol.MessageTextMessage, &tm)
 	}
 	return nil
 }
@@ -2193,9 +2363,8 @@ func (s *Server) conn(sessionID uint32) *connection.Conn {
 	return s.conns[sessionID]
 }
 
-func (s *Server) handleVoiceTarget(msgType protocol.MessageType, payload []byte, ctx interface{}) error {
-	c := ctx.(*connection.Conn)
-	if c.State() != connection.StateActive {
+func (s *Server) handleVoiceTarget(msgType protocol.MessageType, payload []byte, c Peer) error {
+	if !s.peerActive(c) {
 		return nil
 	}
 	var vt messages.VoiceTarget
@@ -2211,6 +2380,9 @@ func (s *Server) handleVoiceTarget(msgType protocol.MessageType, payload []byte,
 
 var udpTunnelCount sync.Map // session -> *uint64
 
+// handleUDPTunnel is a Local Edge entry: TCP-tunneled audio is decoded with
+// the connection's negotiated wire mode and fed into the Core voice router
+// as a canonical frame.
 func (s *Server) handleUDPTunnel(msgType protocol.MessageType, payload []byte, ctx interface{}) error {
 	c := ctx.(*connection.Conn)
 	if c.State() != connection.StateActive || s.router == nil {
@@ -2220,12 +2392,11 @@ func (s *Server) handleUDPTunnel(msgType protocol.MessageType, payload []byte, c
 	if err != nil {
 		return err
 	}
-	return s.router.Route(c.SessionID(), frame)
+	return s.router.RouteRef(cluster.SessionRef{SessionID: c.SessionID(), Generation: c.SessionGeneration()}, frame)
 }
 
-func (s *Server) handleBanList(msgType protocol.MessageType, payload []byte, ctx interface{}) error {
-	c := ctx.(*connection.Conn)
-	if c.State() != connection.StateActive {
+func (s *Server) handleBanList(msgType protocol.MessageType, payload []byte, c Peer) error {
+	if !s.peerActive(c) {
 		return nil
 	}
 	var bl messages.BanList
@@ -2252,9 +2423,8 @@ func (s *Server) handleBanList(msgType protocol.MessageType, payload []byte, ctx
 	return nil
 }
 
-func (s *Server) handleACL(msgType protocol.MessageType, payload []byte, ctx interface{}) error {
-	c := ctx.(*connection.Conn)
-	if c.State() != connection.StateActive {
+func (s *Server) handleACL(msgType protocol.MessageType, payload []byte, c Peer) error {
+	if !s.peerActive(c) {
 		return nil
 	}
 	var aclMsg messages.ACL
@@ -2269,9 +2439,8 @@ func (s *Server) handleACL(msgType protocol.MessageType, payload []byte, ctx int
 	return nil
 }
 
-func (s *Server) handlePermissionQuery(msgType protocol.MessageType, payload []byte, ctx interface{}) error {
-	c := ctx.(*connection.Conn)
-	if c.State() != connection.StateActive {
+func (s *Server) handlePermissionQuery(msgType protocol.MessageType, payload []byte, c Peer) error {
+	if !s.peerActive(c) {
 		return nil
 	}
 	var pq messages.PermissionQuery
@@ -2289,9 +2458,8 @@ func (s *Server) handlePermissionQuery(msgType protocol.MessageType, payload []b
 	return nil
 }
 
-func (s *Server) handleRequestBlob(msgType protocol.MessageType, payload []byte, ctx interface{}) error {
-	c := ctx.(*connection.Conn)
-	if c.State() != connection.StateActive {
+func (s *Server) handleRequestBlob(msgType protocol.MessageType, payload []byte, c Peer) error {
+	if !s.peerActive(c) {
 		return nil
 	}
 	var rb messages.RequestBlob
@@ -2302,7 +2470,7 @@ func (s *Server) handleRequestBlob(msgType protocol.MessageType, payload []byte,
 	return nil
 }
 
-func (s *Server) sendRequestedBlobs(c *connection.Conn, rb *messages.RequestBlob) {
+func (s *Server) sendRequestedBlobs(c Peer, rb *messages.RequestBlob) {
 	for _, sid := range rb.SessionTexture {
 		if u, ok := s.users.Snapshot(sid); ok && len(u.Texture) > 0 {
 			_ = c.WriteMessage(protocol.MessageUserState, &messages.UserState{
@@ -2328,9 +2496,8 @@ func (s *Server) sendRequestedBlobs(c *connection.Conn, rb *messages.RequestBlob
 	}
 }
 
-func (s *Server) handleUserStats(msgType protocol.MessageType, payload []byte, ctx interface{}) error {
-	c := ctx.(*connection.Conn)
-	if c.State() != connection.StateActive {
+func (s *Server) handleUserStats(msgType protocol.MessageType, payload []byte, c Peer) error {
+	if !s.peerActive(c) {
 		return nil
 	}
 	var req messages.UserStats
@@ -2346,9 +2513,8 @@ func (s *Server) handleUserStats(msgType protocol.MessageType, payload []byte, c
 	return nil
 }
 
-func (s *Server) handleQueryUsers(msgType protocol.MessageType, payload []byte, ctx interface{}) error {
-	c := ctx.(*connection.Conn)
-	if c.State() != connection.StateActive {
+func (s *Server) handleQueryUsers(msgType protocol.MessageType, payload []byte, c Peer) error {
+	if !s.peerActive(c) {
 		return nil
 	}
 	var qu messages.QueryUsers

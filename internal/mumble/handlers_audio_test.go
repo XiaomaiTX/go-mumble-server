@@ -103,7 +103,7 @@ func TestAudioTransportMatrix(t *testing.T) {
 						_, bTCP, bCrypt := audioClient(t, s, b, out)
 						bUDP := udpSocket(t)
 						if udpOut {
-							s.addrBySession.Store(b.SessionID, bUDP.LocalAddr())
+							s.addrBySession.Store(userRef(b), bUDP.LocalAddr())
 						}
 						input := clientAudio(in, 0)
 						if udpIn {
@@ -141,7 +141,7 @@ func TestAudioMixedCryptoAndRebinding(t *testing.T) {
 	b := &mumble.User{Name: "b"}
 	_, bTCP, _ := audioClient(t, s, b, ma.WireProtobuf)
 	addr := udpSocket(t).LocalAddr()
-	s.addrBySession.Store(b.SessionID, addr)
+	s.addrBySession.Store(userRef(b), addr)
 	s.channelCryptoMu.Lock()
 	s.channelCrypto[b.ChannelID] = "mixed"
 	s.channelCryptoMu.Unlock()
@@ -152,7 +152,7 @@ func TestAudioMixedCryptoAndRebinding(t *testing.T) {
 		if kind != protocol.MessageUDPTunnel || p[0] != 0 {
 			t.Fatalf("回退改变 wire mode: %x", p)
 		}
-		mapped, _ := s.addrBySession.Load(a.SessionID)
+		mapped, _ := s.addrBySession.Load(userRef(a))
 		if mapped.(net.Addr).String() != newAddr.String() {
 			t.Fatal("NAT 重绑定未更新")
 		}

@@ -156,6 +156,7 @@ func ConfigForServer(meta *MetaConfig, server *ServerConfigData, bootstrap *Conf
 		MaxListenersPerUser:   server.MaxListenersPerUser,
 	}
 	if bootstrap != nil {
+		cfg.Mode = bootstrap.Mode
 		cfg.DatabasePath = bootstrap.DatabasePath
 		cfg.SSLCertPath = bootstrap.SSLCertPath
 		cfg.SSLKeyPath = bootstrap.SSLKeyPath
@@ -174,6 +175,9 @@ func ConfigForServer(meta *MetaConfig, server *ServerConfigData, bootstrap *Conf
 		cfg.ExternalAuthClientCertPath = bootstrap.ExternalAuthClientCertPath
 		cfg.ExternalAuthClientKeyPath = bootstrap.ExternalAuthClientKeyPath
 		cfg.IdentityRevalidateToken = bootstrap.IdentityRevalidateToken
+	}
+	if cfg.Mode == "" {
+		cfg.Mode = ModeStandalone
 	}
 	if cfg.RegisterName == "" {
 		cfg.RegisterName = "go-mumble-server"

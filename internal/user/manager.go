@@ -69,6 +69,16 @@ func (m *Manager) Add(u mumble.User) (mumble.User, bool) {
 
 // Remove removes a user by session ID, returning a copy of the removed record.
 func (m *Manager) Remove(sessionID uint32) (mumble.User, bool) {
+	return m.remove(sessionID, 0, false)
+}
+
+// RemoveIfGeneration removes only the exact logical session. It prevents a
+// delayed disconnect from deleting a newer user that reused the same ID.
+func (m *Manager) RemoveIfGeneration(sessionID uint32, generation uint64) (mumble.User, bool) {
+	return m.remove(sessionID, generation, true)
+}
+
+func (m *Manager) remove(sessionID uint32, generation uint64, conditional bool) (mumble.User, bool) {
 	m.mu.Lock()
 	var changed *mumble.User
 	listeners := append([]func(mumble.User, bool){}, m.authorizationListeners...)
@@ -81,7 +91,7 @@ func (m *Manager) Remove(sessionID uint32) (mumble.User, bool) {
 		}
 	}()
 	u := m.bySession[sessionID]
-	if u == nil {
+	if u == nil || (conditional && u.SessionGeneration != generation) {
 		return mumble.User{}, false
 	}
 	snapshot := cloneUser(u)

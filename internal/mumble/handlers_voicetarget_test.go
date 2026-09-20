@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"github.com/dchote/go-mumble-server/internal/acl"
 	"github.com/dchote/go-mumble-server/internal/channel"
+	"github.com/dchote/go-mumble-server/internal/cluster"
 	"github.com/dchote/go-mumble-server/internal/connection"
 	"github.com/dchote/go-mumble-server/internal/database/models"
 	"github.com/dchote/go-mumble-server/pkg/mumble"
@@ -14,6 +15,11 @@ import (
 	"sync"
 	"testing"
 )
+
+// userRef builds the SessionRef of a user stored by users.Add (connectTestUser).
+func userRef(u *mumble.User) cluster.SessionRef {
+	return cluster.SessionRef{SessionID: u.SessionID, Generation: u.SessionGeneration}
+}
 
 func TestVoiceTargetSessionReuse(t *testing.T) {
 	s := newVoiceTargetTestServer(t)
@@ -29,7 +35,7 @@ func TestVoiceTargetSessionReuse(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.users.Remove(b.SessionID)
-	s.UnregisterConn(b.SessionID)
+	s.UnregisterConn(userRef(b))
 	c := &mumble.User{Name: "c"}
 	connectTestUser(t, s, c)
 	if c.SessionID != b.SessionID {
@@ -170,34 +176,31 @@ func TestVoiceTargetDynamicLinksChildrenGroups(t *testing.T) {
 	assertVoiceRecipients(t, s, a.SessionID)
 }
 
-func TestVoiceTargetPinsConnectionThroughSend(t *testing.T) {
+func TestVoiceTargetPinsSessionRefThroughSend(t *testing.T) {
 	s := newVoiceTargetTestServer(t)
 	a := &mumble.User{Name: "a"}
 	ac, _ := connectTestUser(t, s, a)
 	b := &mumble.User{Name: "b"}
-	_, bc := connectTestUser(t, s, b)
+	connectTestUser(t, s, b)
 	setVoiceTarget(t, s, ac, messages.VoiceTargetTarget{Session: []uint32{b.SessionID}})
-	resolved := s.resolveVoiceTarget(a.SessionID, 1)
+	frame := ma.Frame{OpusData: []byte{1, 2, 3}}
+	resolved := s.resolveVoiceTargetCanonical(a.SessionID, 1, frame)
 	if len(resolved) != 1 {
 		t.Fatal("目标未解析")
 	}
 	s.users.Remove(b.SessionID)
-	s.UnregisterConn(b.SessionID)
+	s.UnregisterConn(userRef(b))
 	c := &mumble.User{Name: "c"}
-	connectTestUser(t, s, c)
+	_, cc := connectTestUser(t, s, c)
 	if c.SessionID != b.SessionID {
 		t.Fatal("未复用 session")
 	}
-	packet := []byte{1, 2, 3}
-	r := resolved[0]
-	if err := s.sendAudioTo(r.session, r.conn, nil, packet); err != nil {
+	// 显式目标固定 SessionRef：复用 session ID 的新用户不进入接收者集合。
+	assertVoiceRecipients(t, s, a.SessionID)
+	if err := s.SendVoice(userRef(a), frame, resolved); err != nil {
 		t.Fatal(err)
 	}
-	kind, got := readMessage(t, bc)
-	if kind != protocol.MessageUDPTunnel || !bytes.Equal(got, packet) {
-		t.Fatal("发送未使用原连接")
-	}
-	assertVoiceRecipients(t, s, a.SessionID)
+	expectNoBroadcast(t, cc)
 }
 
 func TestVoiceTargetConcurrentSessionReuse(t *testing.T) {
@@ -208,7 +211,7 @@ func TestVoiceTargetConcurrentSessionReuse(t *testing.T) {
 	connectTestUser(t, s, b)
 	setVoiceTarget(t, s, ac, messages.VoiceTargetTarget{Session: []uint32{b.SessionID}})
 	s.users.Remove(b.SessionID)
-	s.UnregisterConn(b.SessionID)
+	s.UnregisterConn(userRef(b))
 	var wg sync.WaitGroup
 	wg.Add(3)
 	go func() {
@@ -224,7 +227,7 @@ func TestVoiceTargetConcurrentSessionReuse(t *testing.T) {
 			c.SetActive()
 			s.RegisterConn(u.SessionID, c)
 			s.users.Remove(u.SessionID)
-			s.UnregisterConn(u.SessionID)
+			s.UnregisterConn(userRef(&u))
 		}
 	}()
 	go func() {
@@ -245,7 +248,7 @@ func TestVoiceTargetConcurrentSessionReuse(t *testing.T) {
 	wg.Wait()
 	// 发送者断线后，其目标也不能被继任连接继承。
 	s.users.Remove(a.SessionID)
-	s.UnregisterConn(a.SessionID)
+	s.UnregisterConn(userRef(a))
 	replacement := &mumble.User{Name: "new-owner"}
 	connectTestUser(t, s, replacement)
 	assertVoiceRecipients(t, s, replacement.SessionID)
