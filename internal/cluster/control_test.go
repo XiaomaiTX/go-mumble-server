@@ -95,7 +95,19 @@ func newSyncingTransport(t *testing.T) (*ControlTransport, *Registry, *fakeSink,
 	if err := tr.BeginSync(a, sink, 8); err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = tr.AbortSync(a) })
 	return tr, r, sink, a
+}
+
+func waitWrites(t *testing.T, sink *fakeSink, count int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for len(sink.snapshot()) < count {
+		if time.Now().After(deadline) {
+			t.Fatalf("写入未完成: got %d, want %d", len(sink.snapshot()), count)
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 func ids(cms []ControlMessage) []int {
@@ -133,12 +145,14 @@ func TestControlTransportDeferredSpliceOrder(t *testing.T) {
 	if err := tr.Send(a, msg(11)); err != nil {
 		t.Fatal(err)
 	}
+	waitWrites(t, sink, 3)
 	if got := ids(sink.snapshot()); !equalIDs(got, 1, 2, 3) {
 		t.Fatalf("pre-commit writes = %v, want initial lane only", got)
 	}
 	if err := tr.CommitSync(context.Background(), a); err != nil {
 		t.Fatal(err)
 	}
+	waitWrites(t, sink, 5)
 	if got := ids(sink.snapshot()); !equalIDs(got, 1, 2, 3, 10, 11) {
 		t.Fatalf("post-commit writes = %v, want deferred after initial", got)
 	}
@@ -149,6 +163,7 @@ func TestControlTransportDeferredSpliceOrder(t *testing.T) {
 	if err := tr.Send(a, msg(12)); err != nil {
 		t.Fatal(err)
 	}
+	waitWrites(t, sink, 6)
 	if got := ids(sink.snapshot()); !equalIDs(got, 1, 2, 3, 10, 11, 12) {
 		t.Fatalf("post-active writes = %v", got)
 	}
@@ -174,6 +189,7 @@ func TestControlTransportBarrierWaitsForWriteReceipt(t *testing.T) {
 	if err := <-committed; err != nil {
 		t.Fatal(err)
 	}
+	waitWrites(t, sink, 2)
 	if got := ids(sink.snapshot()); !equalIDs(got, 1, 9) {
 		t.Fatalf("post-barrier writes = %v", got)
 	}

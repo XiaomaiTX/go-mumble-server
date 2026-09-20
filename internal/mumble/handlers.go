@@ -587,6 +587,7 @@ func NewServer(cfg *config.Config, db *gorm.DB, serverID uint, udpConn net.Packe
 	s.dispatcher = cluster.NewDispatcher(registry)
 	s.dispatcher.RegisterVoiceTransport(cluster.LocalEdgeID, localVoiceTransport{s: s})
 	s.control = cluster.NewControlTransport(registry)
+	s.control.SetFailureHandler(s.controlFailed)
 	if strings.EqualFold(cfg.AuthMode, "external") {
 		s.authority, s.authorityErr = identity.NewExternalHTTPAuthority(identity.ExternalHTTPConfig{
 			BaseURL: cfg.ExternalAuthURL, ServiceToken: cfg.ExternalAuthServiceToken,
@@ -744,10 +745,7 @@ func (s *Server) RefreshEnterStatesFor(sessionID uint32) {
 }
 
 func (s *Server) refreshEnterStatesFor(u mumble.User, channels []*mumble.Channel, restricted map[uint32]bool) {
-	ref, ok := s.registry.Ref(u.SessionID)
-	if !ok {
-		return
-	}
+	ref := cluster.SessionRef{SessionID: u.SessionID, Generation: u.SessionGeneration}
 	subject := acl.SubjectOf(u)
 	for _, ch := range channels {
 		_ = s.control.Send(ref, cluster.ControlMessage{
@@ -1000,19 +998,33 @@ func (s *Server) KickSession(sessionID uint32, reason string) bool {
 	if !ok {
 		return false
 	}
+	return s.KickSessionRef(cluster.SessionRef{SessionID: sessionID, Generation: u.SessionGeneration}, reason)
+}
+
+// KickSessionRef 只踢出指定 generation；关闭通知与该会话解绑串行化，
+// 用户删除仍在 Manager 锁内校验 generation。
+func (s *Server) KickSessionRef(ref cluster.SessionRef, reason string) bool {
+	u, ok := s.users.SnapshotRef(ref)
+	if !ok {
+		return false
+	}
 	channelID := u.ChannelID
-	ur := &messages.UserRemove{Session: sessionID, Actor: 0, Reason: reason, Ban: false}
-	ref := cluster.SessionRef{SessionID: sessionID, Generation: u.SessionGeneration}
-	if s.beginCloseAnnounced(sessionID, u.SessionGeneration) {
-		s.Broadcast(sessionID, protocol.MessageUserRemove, ur)
+	ur := &messages.UserRemove{Session: ref.SessionID, Actor: 0, Reason: reason, Ban: false}
+	_, err := s.registry.BeginCloseAndNotify(ref, func(snap cluster.SessionSnapshot) {
+		if _, live := s.users.SnapshotRef(ref); live && snap.Announced {
+			s.Broadcast(ref.SessionID, protocol.MessageUserRemove, ur)
+		}
+	})
+	if err != nil {
+		return false
 	}
 	s.sendThenClose(ref, protocol.MessageUserRemove, ur)
-	s.users.RemoveIfGeneration(sessionID, u.SessionGeneration)
+	s.users.RemoveIfGeneration(ref.SessionID, ref.Generation)
 	s.UnregisterConn(ref)
 	if channelID != 0 {
 		s.UpdateChannelCrypto(channelID)
 	}
-	slog.Info("User kicked via REST", "session", sessionID, "name", u.Name, "reason", reason)
+	slog.Info("User kicked", "session", ref.SessionID, "name", u.Name, "reason", reason)
 	return true
 }
 

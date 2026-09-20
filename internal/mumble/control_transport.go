@@ -48,18 +48,25 @@ func (s controlSink) Close() error {
 // the transport after the write receipt (SendThenClose contract): kicks, bans
 // and rejects must be the last message on the wire, never followed by another
 // queued write. The full SessionRef is required: a final message for a stale
-// generation must not reach the session that reused the ID. Falls back to the
-// raw connection for sessions that never entered the transport.
+// generation must not reach the session that reused the ID.
+// 不绕过关闭队列重试原始连接，否则可能重复或追加 final message。
 func (s *Server) sendThenClose(ref cluster.SessionRef, msgType protocol.MessageType, msg messages.Message) {
 	if _, ok := s.registry.Snapshot(ref); !ok {
 		return
 	}
-	if err := s.control.SendThenClose(ref, cluster.ControlMessage{Type: msgType, Message: msg}, controlDeadline()); err == nil {
-		return
-	}
-	if c := s.conn(ref.SessionID); c != nil && c.SessionGeneration() == ref.Generation {
-		_ = c.WriteMessage(msgType, msg)
-		_ = c.CloseAfterFlush()
+	_ = s.control.SendThenClose(ref, cluster.ControlMessage{Type: msgType, Message: msg}, controlDeadline())
+}
+
+// controlFailed 清理失败的精确 generation，远端 sink 无需模拟本地断线回调。
+func (s *Server) controlFailed(ref cluster.SessionRef, _ error) {
+	_, _ = s.registry.BeginCloseAndNotify(ref, func(snap cluster.SessionSnapshot) {
+		if snap.Announced {
+			s.Broadcast(ref.SessionID, protocol.MessageUserRemove, &messages.UserRemove{Session: ref.SessionID})
+		}
+	})
+	s.UnregisterConn(ref)
+	if u, ok := s.users.RemoveIfGeneration(ref.SessionID, ref.Generation); ok && u.ChannelID != 0 {
+		s.UpdateChannelCrypto(u.ChannelID)
 	}
 }
 

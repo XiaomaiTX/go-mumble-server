@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dchote/go-mumble-server/internal/cluster"
 	"github.com/dchote/go-mumble-server/internal/config"
 	"github.com/dchote/go-mumble-server/internal/database/models"
 	"github.com/dchote/go-mumble-server/internal/identity"
@@ -57,6 +58,13 @@ func TestRevalidationUpdatesRuntimeGroupsAndCanonicalName(t *testing.T) {
 	stored, ok := srv.users.Add(pkgmumble.User{UserID: 173, Name: "Old Name", ExternalIdentity: true, ExternalGroups: []string{"role:leader"}, IdentityLastValidatedAt: time.Now()})
 	if !ok {
 		t.Fatal("add external user")
+	}
+	ref := cluster.SessionRef{SessionID: stored.SessionID, Generation: stored.SessionGeneration}
+	if err := srv.registry.Bind(ref, cluster.LocalEdgeID); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.registry.CommitActive(ref); err != nil {
+		t.Fatal(err)
 	}
 	srv.authority = &fakeAuthority{resolved: []identity.Identity{{Eligible: true, UserID: 173, Name: "New Name", Groups: []string{"authenticated", "role:member"}, IdentityVersion: 3, PolicyVersion: 9}}}
 	if err := srv.RevalidateUserNow(context.Background(), 173); err != nil {

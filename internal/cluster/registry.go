@@ -110,6 +110,34 @@ func (r *Registry) transition(ref SessionRef) (*entry, error) {
 	return e, nil
 }
 
+// withTransition 将操作与指定 generation 的生命周期迁移串行化。
+func (r *Registry) withTransition(ref SessionRef, fn func(SessionSnapshot) error) error {
+	e, err := r.transition(ref)
+	if err != nil {
+		return err
+	}
+	defer e.transition.Unlock()
+	r.mu.RLock()
+	current := r.sessions[ref.SessionID]
+	if current != e || e.ref != ref {
+		r.mu.RUnlock()
+		return ErrStaleSession
+	}
+	snap := snapshot(e)
+	r.mu.RUnlock()
+	return fn(snap)
+}
+
+// WithSession 将异步业务结果与同一代会话的关闭串行化。回调不得关闭本会话。
+func (r *Registry) WithSession(ref SessionRef, fn func() error) error {
+	return r.withTransition(ref, func(s SessionSnapshot) error {
+		if s.State != StateSyncing && s.State != StateActive {
+			return ErrInvalidState
+		}
+		return fn()
+	})
+}
+
 func (r *Registry) CommitActive(ref SessionRef) error {
 	return r.CommitActiveAndAnnounce(ref, nil)
 }
@@ -148,11 +176,25 @@ func (r *Registry) commitActive(ref SessionRef) error {
 }
 
 func (r *Registry) BeginClose(ref SessionRef) (SessionSnapshot, error) {
+	return r.BeginCloseAndNotify(ref, nil)
+}
+
+// BeginCloseAndNotify 让关闭广播与同一 generation 的解绑串行化。
+// notify 不得再次关闭或解绑本会话。
+func (r *Registry) BeginCloseAndNotify(ref SessionRef, notify func(SessionSnapshot)) (SessionSnapshot, error) {
 	e0, err := r.transition(ref)
 	if err != nil {
 		return SessionSnapshot{}, err
 	}
 	defer e0.transition.Unlock()
+	snap, err := r.beginClose(ref)
+	if err == nil && notify != nil {
+		notify(snap)
+	}
+	return snap, err
+}
+
+func (r *Registry) beginClose(ref SessionRef) (SessionSnapshot, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	e := r.sessions[ref.SessionID]

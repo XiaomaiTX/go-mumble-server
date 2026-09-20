@@ -67,6 +67,7 @@ func TestControlPayloadOwnership(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
+			waitWrites(t, sink, 1)
 			got := sink.snapshot()[0].Message.(*messages.TextMessage)
 			if got.Message != "原始内容" || got.Session[0] != 7 {
 				t.Fatalf("队列引用了调用方内存: %+v", got)

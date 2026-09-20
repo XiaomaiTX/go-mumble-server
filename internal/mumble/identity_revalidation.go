@@ -8,9 +8,12 @@ import (
 	"slices"
 	"time"
 
+	"github.com/dchote/go-mumble-server/internal/acl"
+	"github.com/dchote/go-mumble-server/internal/cluster"
 	"github.com/dchote/go-mumble-server/internal/identity"
 	pkgmumble "github.com/dchote/go-mumble-server/pkg/mumble"
 	"github.com/dchote/go-mumble-server/pkg/mumble/protocol"
+	"github.com/dchote/go-mumble-server/pkg/mumble/protocol/messages"
 )
 
 func (s *Server) StartIdentityRevalidation(ctx context.Context) error {
@@ -55,7 +58,7 @@ func (s *Server) RevalidateUserNow(ctx context.Context, userID uint32) error {
 }
 
 type externalSession struct {
-	SessionID       uint32
+	Ref             cluster.SessionRef
 	UserID          uint32
 	LastValidatedAt time.Time
 }
@@ -65,7 +68,7 @@ func (s *Server) externalUserSnapshots() []externalSession {
 	result := make([]externalSession, 0, len(users))
 	for _, user := range users {
 		if user.ExternalIdentity && user.UserID != 0 {
-			result = append(result, externalSession{SessionID: user.SessionID, UserID: user.UserID, LastValidatedAt: user.IdentityLastValidatedAt})
+			result = append(result, externalSession{Ref: cluster.SessionRef{SessionID: user.SessionID, Generation: user.SessionGeneration}, UserID: user.UserID, LastValidatedAt: user.IdentityLastValidatedAt})
 		}
 	}
 	return result
@@ -95,7 +98,6 @@ func (s *Server) revalidateSnapshots(ctx context.Context, sessions []externalSes
 		}
 	}
 	now := time.Now()
-	changed := false
 	for _, session := range sessions {
 		resolved, found := byID[session.UserID]
 		if !found {
@@ -103,33 +105,44 @@ func (s *Server) revalidateSnapshots(ctx context.Context, sessions []externalSes
 			continue
 		}
 		if !resolved.Eligible {
-			s.KickSession(session.SessionID, "identity is no longer eligible")
+			s.KickSessionRef(session.Ref, "identity is no longer eligible")
 			continue
 		}
-		before, ok := s.users.Snapshot(session.SessionID)
-		if !ok {
-			continue
-		}
-		updated, ok := s.users.UpdateIdentity(session.SessionID, func(user *pkgmumble.User) {
-			user.Name = resolved.Name
-			user.ExternalGroups = append([]string(nil), resolved.Groups...)
-			user.IdentityVersion = resolved.IdentityVersion
-			user.PolicyVersion = resolved.PolicyVersion
-			user.IdentityLastValidatedAt = now
+		conflict := false
+		_ = s.registry.WithSession(session.Ref, func() error {
+			identityChanged := false
+			updated, ok := s.users.UpdateIdentityRefAndPublish(session.Ref, func(user *pkgmumble.User) {
+				identityChanged = user.Name != resolved.Name || !slices.Equal(user.ExternalGroups, resolved.Groups) || user.IdentityVersion != resolved.IdentityVersion || user.PolicyVersion != resolved.PolicyVersion
+				user.Name = resolved.Name
+				user.ExternalGroups = append([]string(nil), resolved.Groups...)
+				user.IdentityVersion = resolved.IdentityVersion
+				user.PolicyVersion = resolved.PolicyVersion
+				user.IdentityLastValidatedAt = now
+			}, func(updated pkgmumble.User) {
+				if identityChanged {
+					s.Broadcast(updated.SessionID, protocol.MessageUserState, userToState(updated))
+				}
+			})
+			conflict = !ok
+			if ok && identityChanged {
+				// 权限刷新也固定在原 generation，并与关闭串行化。
+				s.invalidateACLCache()
+				maySpeak := s.maySpeak(acl.SubjectOf(updated), updated.ChannelID)
+				suppressChanged := false
+				_, _ = s.users.UpdateIdentityRefAndPublish(session.Ref, func(user *pkgmumble.User) {
+					suppressChanged = applySuppressFromSpeak(user, maySpeak)
+				}, func(user pkgmumble.User) {
+					if suppressChanged {
+						s.Broadcast(0, protocol.MessageUserState, &messages.UserState{Session: user.SessionID, Suppress: user.Suppress, SetFields: messages.UserStateSetSession | messages.UserStateSetSuppress})
+					}
+				})
+				s.refreshEnterStatesFor(updated, s.chans.GetTree(), s.enterRestrictedChannels())
+			}
+			return nil
 		})
-		if !ok {
-			s.KickSession(session.SessionID, "canonical identity conflicts with an online user")
-			continue
+		if conflict {
+			s.KickSessionRef(session.Ref, "canonical identity conflicts with an online user")
 		}
-		if before.Name != updated.Name || !slices.Equal(before.ExternalGroups, updated.ExternalGroups) || before.IdentityVersion != updated.IdentityVersion || before.PolicyVersion != updated.PolicyVersion {
-			changed = true
-			s.Broadcast(updated.SessionID, protocol.MessageUserState, userToState(updated))
-		}
-	}
-	if changed {
-		s.invalidateACLCache()
-		s.RefreshSuppressStates()
-		s.RefreshEnterStates()
 	}
 	return nil
 }
@@ -141,7 +154,7 @@ func (s *Server) applyRevalidationFailure(sessions []externalSession, now time.T
 	}
 	for _, session := range sessions {
 		if session.LastValidatedAt.IsZero() || now.Sub(session.LastValidatedAt) > grace {
-			s.KickSession(session.SessionID, "identity could not be revalidated within stale grace")
+			s.KickSessionRef(session.Ref, "identity could not be revalidated within stale grace")
 		}
 	}
 }

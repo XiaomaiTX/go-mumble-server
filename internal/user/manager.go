@@ -4,6 +4,7 @@ import (
 	"slices"
 	"sync"
 
+	"github.com/dchote/go-mumble-server/internal/cluster"
 	"github.com/dchote/go-mumble-server/pkg/mumble"
 	"gorm.io/gorm"
 )
@@ -168,6 +169,17 @@ func (m *Manager) Snapshot(sessionID uint32) (mumble.User, bool) {
 	return cloneUser(u), true
 }
 
+// SnapshotRef 在用户锁内验证 generation 并复制快照。
+func (m *Manager) SnapshotRef(ref cluster.SessionRef) (mumble.User, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	u := m.bySession[ref.SessionID]
+	if u == nil || u.SessionGeneration != ref.Generation {
+		return mumble.User{}, false
+	}
+	return cloneUser(u), true
+}
+
 // SnapshotByName returns a deep copy of the user with the given username.
 func (m *Manager) SnapshotByName(name string) (mumble.User, bool) {
 	m.mu.RLock()
@@ -285,6 +297,21 @@ func (m *Manager) UpdateUser(sessionID uint32, fn func(*mumble.User)) (mumble.Us
 // UpdateIdentity atomically updates identity fields and keeps the name index in
 // sync. It rejects a canonical rename that collides with another live session.
 func (m *Manager) UpdateIdentity(sessionID uint32, fn func(*mumble.User)) (mumble.User, bool) {
+	return m.updateIdentity(cluster.SessionRef{SessionID: sessionID}, false, fn, nil)
+}
+
+// UpdateIdentityRef 在同一用户锁内验证 generation 并更新身份。
+func (m *Manager) UpdateIdentityRef(ref cluster.SessionRef, fn func(*mumble.User)) (mumble.User, bool) {
+	return m.updateIdentity(ref, true, fn, nil)
+}
+
+// UpdateIdentityRefAndPublish 在用户锁内校验、更新并发布结果，避免更新后
+// 到广播前发生 ID 复用。publish 只能入队，不得回调 Manager 或等待网络。
+func (m *Manager) UpdateIdentityRefAndPublish(ref cluster.SessionRef, fn func(*mumble.User), publish func(mumble.User)) (mumble.User, bool) {
+	return m.updateIdentity(ref, true, fn, publish)
+}
+
+func (m *Manager) updateIdentity(ref cluster.SessionRef, checkGeneration bool, fn func(*mumble.User), publish func(mumble.User)) (mumble.User, bool) {
 	m.mu.Lock()
 	var changed *mumble.User
 	listeners := append([]func(mumble.User, bool){}, m.authorizationListeners...)
@@ -296,14 +323,14 @@ func (m *Manager) UpdateIdentity(sessionID uint32, fn func(*mumble.User)) (mumbl
 			}
 		}
 	}()
-	u := m.bySession[sessionID]
-	if u == nil {
+	u := m.bySession[ref.SessionID]
+	if u == nil || (checkGeneration && u.SessionGeneration != ref.Generation) {
 		return mumble.User{}, false
 	}
 	oldName := u.Name
 	candidate := cloneUser(u)
 	fn(&candidate)
-	if other := m.byName[candidate.Name]; other != nil && other.SessionID != sessionID {
+	if other := m.byName[candidate.Name]; other != nil && other.SessionID != ref.SessionID {
 		return mumble.User{}, false
 	}
 	candidate.SessionGeneration = u.SessionGeneration
@@ -317,6 +344,9 @@ func (m *Manager) UpdateIdentity(sessionID uint32, fn func(*mumble.User)) (mumbl
 	if oldName != u.Name {
 		delete(m.byName, oldName)
 		m.byName[u.Name] = u
+	}
+	if publish != nil {
+		publish(cloneUser(u))
 	}
 	return cloneUser(u), true
 }
