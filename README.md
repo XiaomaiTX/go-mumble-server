@@ -19,6 +19,8 @@ go-mumble-server re-imagines the Mumble server with modern priorities: a single 
 
 **Per-client security negotiation** — Legacy (default), secure, or lite. Standard Mumble clients use legacy automatically; secure-aware clients upgrade when possible. Mixed-mode channels (e.g. legacy and lite clients together) are automatically relayed through TCP tunnel to maintain correct encryption for each client.
 
+Alongside compatibility with standard Mumble clients and common Murmur functionality, `go-mumble-server` provides a unique **Core-Edge multi-mode architecture**. The same binary can run as `standalone`, `core`, or `edge`, separating authoritative server state from client network ingress for horizontal scaling and future multi-region deployments.
+
 ### Screenshots
 
 ![Dashboard](images/dashboard.png)
@@ -54,6 +56,8 @@ go-mumble-server re-imagines the Mumble server with modern priorities: a single 
 - **REST API** — Server management, monitoring, and integration with Swagger UI at `/docs`
 - **Web management UI** — Vue 3 + Vuetify frontend embedded in the server binary
 - **SQLite storage** — Zero-config persistence for users, channels, ACLs, and bans
+- **Core-Edge modes** — One binary supports `standalone`, `core`, and `edge`; Core owns channels, users, permissions, bans, and voice routing while multiple Edges handle client ingress.
+- **Multi-region expansion** — Edges can be deployed by region or network path, providing a foundation for nearby access, lower latency, and fault isolation while users remain in one shared server.
 
 ### Protocol Library
 
@@ -129,6 +133,8 @@ Use `-timeout=30s` to avoid hanging. For race detection: `CGO_ENABLED=1 go test 
 # With environment variables
 MUMBLE_MUMBLE_PORT=64738 MUMBLE_REST_PORT=64730 ./go-mumble-server
 ```
+
+The same binary supports three runtime modes: `standalone` keeps Core, Local Edge, client transport, and REST on one machine; `core` adds remote Edge access; `edge` handles client TCP/TLS, UDP, and the Core connection without opening a local database. Core and Edge use mutual TLS, and Edges reconnect automatically after a disruption. Small deployments can stay standalone and add Edges later as capacity or regional access needs grow. See [Core / Edge Deployment](docs/core-edge-deployment.md).
 
 ## Docker Deployment
 
@@ -406,6 +412,7 @@ go-mumble-server/
 
 - [Product Overview](docs/product-overview.md) — Project vision and feature summary
 - [Technical Overview](docs/technical-overview.md) — Architecture, subsystems, and design decisions
+- [Core / Edge Deployment](docs/core-edge-deployment.md) — Runtime modes, mTLS certificates, and multi-node deployment
 - [Deployment with Caddy](docs/deployment-caddy.md) — Reverse proxy setup (recommended for production)
 
 ### Protocol

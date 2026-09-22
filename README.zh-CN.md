@@ -20,6 +20,8 @@ go-mumble-server 以现代优先级重新构想了 Mumble 服务器:单一静态
 
 **逐客户端安全协商** —— Legacy(默认)、secure 或 lite。标准 Mumble 客户端自动使用 legacy;支持 secure 的客户端在可能时升级。混合模式频道(例如 legacy 与 lite 客户端共存)会自动通过 TCP 隧道中继,以确保每个客户端的加密正确性。
 
+在兼容标准 Mumble 客户端和 Murmur 常用功能的基础上,`go-mumble-server` 还提供独有的 **Core-Edge 多模式架构**。同一个二进制可以按需运行单机、Core 或 Edge,将统一的服务器状态与客户端网络接入解耦,为横向扩容和跨地区接入提供基础。
+
 ### 截图
 
 ![Dashboard](images/dashboard.png)
@@ -55,6 +57,8 @@ go-mumble-server 以现代优先级重新构想了 Mumble 服务器:单一静态
 - **REST API** —— 服务器管理、监控与集成,Swagger UI 位于 `/docs`
 - **Web 管理界面** —— Vue 3 + Vuetify 前端嵌入服务器二进制文件
 - **SQLite 存储** —— 用户、频道、ACL 和封禁的零配置持久化
+- **Core-Edge 多模式** —— 同一个二进制支持 `standalone`、`core`、`edge`;在兼容 Murmur 常用功能的基础上,Core 统一维护频道、用户、权限、封禁和语音路由,多个 Edge 负责客户端接入。
+- **跨地区扩展** —— Edge 可按地区或线路部署,为就近接入、低延迟和故障隔离打基础;用户连接不同 Edge 仍处于同一个服务器,可共享频道并正常语音,扩容时直接增加 Edge。
 
 ### 协议库
 
@@ -130,6 +134,8 @@ CGO_ENABLED=1 go test -timeout=30s ./...
 # 使用环境变量
 MUMBLE_MUMBLE_PORT=64738 MUMBLE_REST_PORT=64730 ./go-mumble-server
 ```
+
+同一个二进制支持三种运行方式:默认的 `standalone` 适合单机部署;`core` 在保留本地服务的同时接受远端 Edge;`edge` 只负责客户端 TCP/TLS、UDP 和 Core 接入,不打开本地数据库。Core 与 Edge 之间使用 mTLS,Edge 断线后会自动重连。小型服务器无需改变部署方式,后续可按需增加 Edge 以获得更灵活的接入和横向扩展能力。详见 [Core / Edge 部署说明](docs/core-edge-deployment.md)。
 
 ## Docker 部署
 
@@ -409,6 +415,7 @@ go-mumble-server/
 
 - [产品概述](docs/product-overview.md) —— 项目愿景与功能摘要
 - [技术概述](docs/technical-overview.md) —— 架构、子系统和设计决策
+- [Core / Edge 部署说明](docs/core-edge-deployment.md) —— 三种运行模式、mTLS 证书和多节点部署
 - [使用 Caddy 部署](docs/deployment-caddy.md) —— 反向代理设置(生产环境推荐)
 
 ### 协议
