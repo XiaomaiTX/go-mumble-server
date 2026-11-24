@@ -1,4 +1,15 @@
+---
+status: draft
+doc_type: draft
+owner: maintainers
+last_reviewed: 2026-11-24
+source_of_truth:
+  - docs/spec/README.md
+---
+
 # 下一阶段修复优先级与执行计划
+
+> 早期优先级草案，结论仅适用于下述基线，不代表当前实现。
 
 ## 文档状态
 
@@ -37,7 +48,7 @@ GitHub 当前有 26 个开放 Issue，另有 [#27](https://github.com/XiaomaiTX/
 
 P0 项应先于新协议功能和管理界面功能处理。#3～#5 应作为同一轮 ACL/Group 重构，而不是继续进行局部补丁。
 
-#3～#5 的实现、兼容影响和验收结果见 [0011 ACL 与 Group 联合修复说明](0011-acl-group-fix.md)。
+#3～#5 的实现、兼容影响和验收结果见 [0011 ACL 与 Group 联合修复说明](../archive/0011-acl-group-fix.md)。
 
 ### P1：下一批完成
 
@@ -90,7 +101,7 @@ ACL/Group 基础语义
 
 其中 #6 与 #7 应共享同一个 linked-channel connected-component 实现；#8 与 #9 应共享同一个 BanList replace 流程。
 
-#6、#7 与 #14 的现状边界、实施切分和验收矩阵见 [0012 Linked Channel 修复计划](0012-linked-channel-fix-plan.md)。
+#6、#7 与 #14 的现状边界、实施切分和验收矩阵见 [0012 Linked Channel 修复计划](../archive/0012-linked-channel-fix-plan.md)。
 
 ## 四、下一阶段实施计划
 
@@ -164,14 +175,14 @@ ACL/Group 基础语义
 
 ## 五、代码基线和证据
 
-- VoiceTarget 当前已经保留连接对象并在路由时重新解析频道、Group 和权限：[voicetarget.go](/D:/Projects/go-mumble-server/internal/mumble/voicetarget.go:26)。
-- 普通语音仍通过直接 linked channel 列表路由，且当前只在发送者频道调用 Speak gate：[router.go](/D:/Projects/go-mumble-server/internal/audio/router.go:55)。
-- BanList 查询和空列表更新仍共用不完整的长度判断：[handlers.go](/D:/Projects/go-mumble-server/internal/mumble/handlers.go:2127)。
-- ACL 当前仍存在 `Write` 快速放行和简化 Group 继承：[evaluator.go](/D:/Projects/go-mumble-server/internal/acl/evaluator.go:74)。
-- ChannelState 只为 parent 保留 presence，Name、Description、Position、MaxUsers 等显式零值仍无法表达：[channel.go](/D:/Projects/go-mumble-server/pkg/mumble/protocol/messages/channel.go:45)。
-- Channel Listener 已标记为实现完成，但文档列出了持久化和现代 UDP 音量等已知偏差：[0009-channel-listening.md](/D:/Projects/go-mumble-server/docs/features/0009-channel-listening.md:1)。
-- 外部身份接口已经抽象为 Authenticator、IdentityDirectory 和 IdentityProvider：[authority.go](/D:/Projects/go-mumble-server/internal/identity/authority.go:1)。
-- 当前 runtime 启动路径固定加载 server ID 1，多服务器 API 尚未对应到多个运行实例：[server.go](/D:/Projects/go-mumble-server/internal/server/server.go:57)。
+- VoiceTarget 当前已经保留连接对象并在路由时重新解析频道、Group 和权限：[voicetarget.go](../../../internal/mumble/voicetarget.go)。
+- 普通语音仍通过直接 linked channel 列表路由，且当前只在发送者频道调用 Speak gate：[router.go](../../../internal/audio/router.go)。
+- BanList 查询和空列表更新仍共用不完整的长度判断：[handlers.go](../../../internal/mumble/handlers.go)。
+- ACL 当前仍存在 `Write` 快速放行和简化 Group 继承：[evaluator.go](../../../internal/acl/evaluator.go)。
+- ChannelState 只为 parent 保留 presence，Name、Description、Position、MaxUsers 等显式零值仍无法表达：[channel.go](../../../pkg/mumble/protocol/messages/channel.go)。
+- Channel Listener 已标记为实现完成，但文档列出了持久化和现代 UDP 音量等已知偏差：[0009-channel-listening.md](../../features/current/0009-channel-listening.md)。
+- 外部身份接口已经抽象为 Authenticator、IdentityDirectory 和 IdentityProvider：[authority.go](../../../internal/identity/authority.go)。
+- 当前 runtime 启动路径固定加载 server ID 1，多服务器 API 尚未对应到多个运行实例：[server.go](../../../internal/server/server.go)。
 
 ## 六、发布前最低测试门槛
 

@@ -124,7 +124,7 @@ A separate write goroutine (or buffered channel) serializes outbound messages to
 After authentication, the server sends the full world state via `sendSync` (CryptSetup, channels, users, ServerConfig, ServerSync). The connection is registered for UDP routing immediately after `CryptSetup` is sent, before the rest of the sync, so `HandleUDP` can identify the sender when the client sends its first UDP packet (ping or voice) after receiving `CryptSetup`.
 
 1. All `ChannelState` messages (depth-first from root). `channel_id` is always emitted (root = 0); root omits the `parent` field (proto2 optional).
-2. All `UserState` **snapshots** for connected users (`userToState`). `session` and `channel_id` are always emitted (users in root have `channel_id` 0); voice flags are emitted only when `true` (Murmur snapshot shape — see [0007](../features/0007-userstate-field-presence.md)). After sync completes, a join announce (`Broadcast(joiner, userToState(joiner))`) uses the same snapshot shape for observers.
+2. All `UserState` **snapshots** for connected users (`userToState`). `session` and `channel_id` are always emitted (users in root have `channel_id` 0); voice flags are emitted only when `true` (Murmur snapshot shape — see [0007](../features/current/0007-userstate-field-presence.md)). After sync completes, a join announce (`Broadcast(joiner, userToState(joiner))`) uses the same snapshot shape for observers.
 3. `ServerConfig` with limits and welcome text
 4. `CodecVersion` with negotiated codec
 5. `ServerSync` with the client's session ID, welcome text, and root channel permissions

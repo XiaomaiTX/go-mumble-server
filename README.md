@@ -43,14 +43,14 @@ Alongside compatibility with standard Mumble clients and common Murmur functiona
 
 ### Server
 
-- **Full Mumble protocol** — All 27 control message types, UDP and TCP voice transport
+- **Mumble protocol** — TCP/TLS control and UDP/TCP voice transport; the protocol library defines control message types 0–26. Client compatibility testing is ongoing.
 - **Opus audio** — Opus voice with Legacy and Mumble 1.5 Protobuf packet formats; the server does not transcode audio
 - **Channel hierarchy** — Tree structure with linking, temporary channels, and channel listeners. Root channel ID is always 0 per Mumble protocol; clients receive full channel tree and user sync (including users in root).
 - **ACL permissions** — Group-based access control with inheritance, tokens, and per-channel overrides
 - **Text messaging** — Private, channel, and tree-wide messages with HTML support
 - **Whisper / voice targets** — Directed audio to specific users, channels (including root), or groups
 - **User management** — Certificate-based identity, registration, and server passwords
-- **Virtual servers** — Multiple logical servers in a single process
+- **Virtual server records** — The management API stores virtual server records; the live Mumble runtime uses server ID `1`. See the [architecture overview](docs/architecture/overview.md).
 - **Negotiated security tiers** — Legacy (OCB2-AES128, default), Secure (AES-256-GCM), or Lite (cleartext UDP for constrained devices); per-client negotiation via TLS. Mixed-mode channels force TCP tunnel relay.
 - **Password security** — Argon2id password hashes for registered users, bcrypt for API users
 - **REST API** — Server management, monitoring, and integration with Swagger UI at `/docs`
@@ -77,7 +77,7 @@ Alongside compatibility with standard Mumble clients and common Murmur functiona
 
 ## Building
 
-See [docs/build-and-test.md](docs/build-and-test.md) for the full build and test guide.
+See [Build and Test Guide](docs/guides/build-and-test.md) for the full build and test guide.
 
 ### Full build (frontend + server)
 
@@ -97,7 +97,7 @@ make build-deb
 ./scripts/build-deb.sh
 ```
 
-Output is in `dist/*.deb` (amd64 and arm64). Use `SKIP_FRONTEND=1 ./scripts/build-deb.sh` to skip the frontend step if it is already built. See [Build and Test](docs/build-and-test.md#building-debian-packages-deb-on-macos-or-linux) for details. **Releases** on GitHub include Linux amd64/arm64 binaries and these .deb packages when you push a version tag (e.g. `v0.1.0`).
+Output is in `dist/*.deb` (amd64 and arm64). Use `SKIP_FRONTEND=1 ./scripts/build-deb.sh` to skip the frontend step if it is already built. See [Build and Test](docs/guides/build-and-test.md#building-debian-packages-deb-on-macos-or-linux) for details. **Releases** on GitHub include Linux amd64/arm64 binaries and these .deb packages when you push a version tag (e.g. `v0.1.0`).
 
 ### Server only (skip frontend)
 
@@ -114,10 +114,10 @@ go build -o go-mumble-server ./cmd/go-mumble-server
 ### Running tests
 
 ```bash
-CGO_ENABLED=1 go test -timeout=30s ./...
+make check
 ```
 
-Use `-timeout=30s` to avoid hanging. For race detection: `CGO_ENABLED=1 go test -race -timeout=60s ./...`
+See the [testing and verification standard](docs/standards/testing-and-verification.md) for targeted tests and build checks.
 
 `pkg/mumble/protocol/messages` additionally runs a schema conformance lint against a vendored copy of the upstream `Mumble.proto` on every test run, catching wire-format drift (wrong field number/type, or an upstream field nobody triaged) before it ships. See [docs/architecture/protocol-encoding.md](docs/architecture/protocol-encoding.md#schema-conformance-lint).
 
@@ -134,7 +134,7 @@ Use `-timeout=30s` to avoid hanging. For race detection: `CGO_ENABLED=1 go test 
 MUMBLE_MUMBLE_PORT=64738 MUMBLE_REST_PORT=64730 ./go-mumble-server
 ```
 
-The same binary supports three runtime modes: `standalone` keeps Core, Local Edge, client transport, and REST on one machine; `core` adds remote Edge access; `edge` handles client TCP/TLS, UDP, and the Core connection without opening a local database. Core and Edge use mutual TLS, and Edges reconnect automatically after a disruption. Small deployments can stay standalone and add Edges later as capacity or regional access needs grow. See [Core / Edge Deployment](docs/core-edge-deployment.md).
+The same binary supports three runtime modes: `standalone` keeps Core, Local Edge, client transport, and REST on one machine; `core` adds remote Edge access; `edge` handles client TCP/TLS, UDP, and the Core connection without opening a local database. Core and Edge use mutual TLS, and Edges reconnect automatically after a disruption. Small deployments can stay standalone and add Edges later as capacity or regional access needs grow. See [Core / Edge Deployment](docs/guides/core-edge-deployment.md).
 
 ## Docker Deployment
 
@@ -237,13 +237,13 @@ Managed via REST API (`/api/v1/meta/config`, `/api/v1/servers/:id/config`) and t
 | Channel nesting limit | 10 | Maximum channel tree depth |
 | Channel count limit | 1000 | Maximum total channels |
 
-See [docs/technical-overview.md](docs/technical-overview.md) for the full configuration reference.
+See the [bootstrap configuration example](configs/mumble-server.toml) and [runtime and startup guide](docs/architecture/runtime-and-startup.md).
 
 ### External Identity Provider
 
 `[auth].mode` defaults to `local`, which preserves local registered-user, password, and certificate login. Set it to `external` to authenticate and resolve stable IDs through an External HTTP Identity Provider; provider `deny`, timeouts, 5xx responses, and invalid responses all fail closed without falling back to local accounts.
 
-Configure the provider's authentication and directory endpoints with `authenticate_path` and `resolve_path`; the defaults use `/api/internal/mumble/v1/...` and can be adapted without changing core code. Authentication responses must include a non-zero stable user ID, a canonical name, and optional authoritative runtime groups. Client access tokens and authoritative groups are stored separately; groups are not persisted to SQLite. Live sessions are revalidated according to `revalidate_interval_seconds` and bounded by `stale_grace_seconds`. See [External Identity Provider](docs/fuxi-seat-external-identity.md).
+Configure the provider's authentication and directory endpoints with `authenticate_path` and `resolve_path`; the defaults use `/api/internal/mumble/v1/...` and can be adapted without changing core code. Authentication responses must include a non-zero stable user ID, a canonical name, and optional authoritative runtime groups. Client access tokens and authoritative groups are stored separately; groups are not persisted to SQLite. Live sessions are revalidated according to `revalidate_interval_seconds` and bounded by `stale_grace_seconds`. See [External Identity Provider](docs/guides/fuxi-seat-external-identity.md).
 
 ## Web Management UI
 
@@ -255,7 +255,7 @@ The frontend can be disabled at runtime with `-frontend-embed=false` for headles
 
 ## REST API
 
-The management API runs on port 64730 by default (configurable via `rest_port` in config or `MUMBLE_REST_PORT`). Interactive Swagger documentation is available at `/docs`. The web UI is a consumer of this same REST API. For production deployments with HTTPS and TLS termination, see [Deployment with Caddy](docs/deployment-caddy.md).
+The management API runs on port 64730 by default (configurable via `rest_port` in config or `MUMBLE_REST_PORT`). Interactive Swagger documentation is available at `/docs`. The web UI is a consumer of this same REST API. For production deployments with HTTPS and TLS termination, see [Deployment with Caddy](docs/guides/deployment-caddy.md).
 
 ```bash
 # Server health
@@ -320,7 +320,7 @@ The library handles framing, native Go control-message encoding, hand-written Le
 
 **Protocol policy:** Do not add the Google protobuf runtime or generated code; both control messages and Audio wire use the project's hand-written encoding strategy. See [docs/architecture/protocol-encoding.md](docs/architecture/protocol-encoding.md).
 
-See [docs/technical-overview.md](docs/technical-overview.md) for the full package layout and the library/server boundary.
+See the [module map](docs/architecture/module-map.md) for the package layout and the library/server boundary.
 
 ## Local Development
 
@@ -408,36 +408,7 @@ go-mumble-server/
 
 ## Documentation
 
-### Core
-
-- [Product Overview](docs/product-overview.md) — Project vision and feature summary
-- [Technical Overview](docs/technical-overview.md) — Architecture, subsystems, and design decisions
-- [Core / Edge Deployment](docs/core-edge-deployment.md) — Runtime modes, mTLS certificates, and multi-node deployment
-- [Deployment with Caddy](docs/deployment-caddy.md) — Reverse proxy setup (recommended for production)
-
-### Protocol
-
-- [Control Messages](docs/protocol/control-messages.md) — TCP message catalog (types 0–26)
-- [Protocol Encoding](docs/architecture/protocol-encoding.md) — Native Go wire encoding, proto2 field presence, snapshot-vs-delta-echo rule, schema conformance lint
-- [Voice Data](docs/protocol/voice-data.md) — UDP audio packet format and routing
-- [MumbleUDP Audio](docs/features/0010-mumbleudp-audio.md) — Legacy and Mumble 1.5 Protobuf Audio support
-- [Security Modes](docs/protocol/security-modes.md) — Per-client crypto tiers (legacy, secure, lite) and mixed-mode enforcement
-- [Encryption](docs/protocol/encryption.md) — TLS, AEAD ciphers, password hashing
-- [Permissions](docs/protocol/permissions.md) — Permission bitmask definitions
-
-### Frontend
-
-- [Frontend Guide](docs/patterns/frontend-guide.md) — Vue 3 and Vuetify conventions
-- [UI Style Guidelines](docs/patterns/ui-style-guidelines.md) — Visual design standards
-
-### Patterns
-
-- [Connection Lifecycle](docs/patterns/connection-lifecycle-pattern.md) — Client connect through disconnect
-- [Handler Table](docs/patterns/handler-table-pattern.md) — Message dispatch by type ID
-- [Channel Tree](docs/patterns/channel-tree-pattern.md) — Hierarchical channel management
-- [Audio Pipeline](docs/patterns/audio-pipeline-pattern.md) — Voice routing and forwarding
-- [ACL Evaluation](docs/patterns/acl-evaluation-pattern.md) — Permission resolution algorithm
-- [Concurrent State](docs/patterns/concurrent-state-pattern.md) — Goroutine-safe shared state
+Start with the [project documentation index](docs/README.md) for architecture, API contracts, operating guides, and contributor standards. The running management API serves Swagger separately at `/docs`.
 
 ## Test Client
 
@@ -457,7 +428,7 @@ go-mumble-server is compatible with any client implementing the standard Mumble 
 - Plumble and other Humla-based Android clients
 - Custom Go clients built on `pkg/mumble/`
 
-See [docs/features/0007-userstate-field-presence.md](docs/features/0007-userstate-field-presence.md) for the Murmur snapshot-vs-delta-echo rule and Humla mute semantics, and [0008](docs/features/0008-userstate-authorization-and-limits.md) for the authorization rules, content limits and recording policy that go with them.
+See [UserState field presence](docs/features/current/0007-userstate-field-presence.md) for the Murmur snapshot-vs-delta-echo rule and Humla mute semantics, and [0008](docs/features/current/0008-userstate-authorization-and-limits.md) for the authorization rules, content limits and recording policy that go with them.
 
 ## License
 

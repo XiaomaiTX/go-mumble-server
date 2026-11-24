@@ -187,7 +187,7 @@ var schemaFieldMap = map[string]map[string]string{
 		"Release":     "release",
 		"OS":          "os",
 		"OSVersion":   "os_version",
-		"CryptoModes": "", // custom extension (field 6); see docs/features/0002-negotiated-security-modes.md
+		"CryptoModes": "", // custom extension (field 6); see docs/features/current/0002-negotiated-security-modes.md
 	},
 	"Authenticate": {
 		"Username":     "username",

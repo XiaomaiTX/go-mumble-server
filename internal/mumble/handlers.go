@@ -666,7 +666,7 @@ func (s *Server) ACLEvaluator() *acl.Evaluator {
 // Note: Humla's AudioHandler treats a suppress-only update as authoritative for the
 // mute OR of mute/self_mute/suppress (absent fields read as false). That is a client
 // bug; we still match murmur's minimal delta rather than over-broadcasting self_mute.
-// See docs/features/0007-userstate-field-presence.md.
+// See docs/features/current/0007-userstate-field-presence.md.
 func (s *Server) RefreshSuppressStates() {
 	if s.acl == nil {
 		return

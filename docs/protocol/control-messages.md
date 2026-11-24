@@ -152,7 +152,7 @@ thing as "always send every field": Murmur only ever sends the fields that are
 actually relevant to a given message, and clients treat a field's mere presence in
 `UserState` as a discrete change notification, not as a full state refresh. See
 [protocol-encoding.md](../architecture/protocol-encoding.md) and
-[0007-userstate-field-presence.md](../features/0007-userstate-field-presence.md)
+[0007-userstate-field-presence.md](../features/current/0007-userstate-field-presence.md)
 for the full rationale and the regression that motivated it.
 
 This server sends `UserState` in two distinct shapes, matching Murmur:
@@ -176,7 +176,7 @@ event, so observers would log a burst of spurious "Muted." / "Recording stopped"
 etc. messages (including on Mumla join announces). Mumla/Humla need the unmute
 echo to carry explicit `self_mute`/`self_deaf` presence, but they do not
 rebroadcast the server's full `UserState` — see
-[0007-userstate-field-presence.md](../features/0007-userstate-field-presence.md).
+[0007-userstate-field-presence.md](../features/current/0007-userstate-field-presence.md).
 
 **Cascade (murmur parity):** deafened implies muted. Setting `self_deaf`/`deaf` to
 true forces the matching mute flag; clearing mute clears deaf; clearing deaf alone

@@ -44,14 +44,14 @@ go-mumble-server 以现代优先级重新构想了 Mumble 服务器:单一静态
 
 ### 服务器
 
-- **完整的 Mumble 协议** —— 全部 27 种控制消息类型,UDP 和 TCP 语音传输
+- **Mumble 协议** —— TCP/TLS 控制通道、UDP/TCP 语音传输；协议库定义类型 0–26 的控制消息，客户端兼容性仍在验收。
 - **Opus 音频** —— 使用 Opus；支持 Legacy 和 Mumble 1.5 Protobuf 封包格式，不进行音频转码
 - **频道层级** —— 树状结构,支持链接、临时频道和频道监听。根据 Mumble 协议,根频道 ID 恒为 0;客户端会收到完整的频道树和用户同步(包括根频道中的用户)。
 - **ACL 权限** —— 基于组的访问控制,支持继承、令牌和逐频道覆盖
 - **文本消息** —— 私聊、频道和全树消息,支持 HTML
 - **耳语 / 语音目标** —— 定向音频发送到特定用户、频道(包括根频道)或组
 - **用户管理** —— 基于证书的身份、注册和服务器密码
-- **虚拟服务器** —— 单进程中运行多个逻辑服务器
+- **虚拟服务器记录** —— 管理 API 可管理多条记录；实时 Mumble 服务使用服务器 ID `1`。见[架构总览](docs/architecture/overview.md)。
 - **可协商的安全层级** —— Legacy(OCB2-AES128,默认)、Secure(AES-256-GCM)或 Lite(面向受限设备的明文 UDP);通过 TLS 逐客户端协商。混合模式频道强制走 TCP 隧道中继。
 - **密码安全** —— 注册用户使用 Argon2id 密码哈希,API 用户使用 bcrypt
 - **REST API** —— 服务器管理、监控与集成,Swagger UI 位于 `/docs`
@@ -78,7 +78,7 @@ go-mumble-server 以现代优先级重新构想了 Mumble 服务器:单一静态
 
 ## 构建
 
-完整的构建与测试指南见 [docs/build-and-test.md](docs/build-and-test.md)。
+完整的构建与测试指南见 [构建与测试指南](docs/guides/build-and-test.md)。
 
 ### 完整构建(前端 + 服务器)
 
@@ -98,7 +98,7 @@ make build-deb
 ./scripts/build-deb.sh
 ```
 
-输出位于 `dist/*.deb`(amd64 和 arm64)。如果前端已构建,可使用 `SKIP_FRONTEND=1 ./scripts/build-deb.sh` 跳过前端步骤。详情见[构建与测试](docs/build-and-test.md#building-debian-packages-deb-on-macos-or-linux)。推送版本标签(如 `v0.1.0`)时,GitHub 上的 **Releases** 会包含 Linux amd64/arm64 二进制文件和这些 .deb 软件包。
+输出位于 `dist/*.deb`(amd64 和 arm64)。如果前端已构建,可使用 `SKIP_FRONTEND=1 ./scripts/build-deb.sh` 跳过前端步骤。详情见[构建与测试](docs/guides/build-and-test.md#building-debian-packages-deb-on-macos-or-linux)。推送版本标签(如 `v0.1.0`)时,GitHub 上的 **Releases** 会包含 Linux amd64/arm64 二进制文件和这些 .deb 软件包。
 
 ### 仅构建服务器(跳过前端)
 
@@ -115,10 +115,10 @@ go build -o go-mumble-server ./cmd/go-mumble-server
 ### 运行测试
 
 ```bash
-CGO_ENABLED=1 go test -timeout=30s ./...
+make check
 ```
 
-使用 `-timeout=30s` 避免挂起。竞态检测:`CGO_ENABLED=1 go test -race -timeout=60s ./...`
+定点测试和构建检查见[测试与验证标准](docs/standards/testing-and-verification.md)。
 
 `pkg/mumble/protocol/messages` 在每次测试运行时还会对上游 `Mumble.proto` 的 vendored 副本执行 schema 一致性检查,在发布前捕获线缆格式漂移(错误的字段编号/类型,或未经甄别的上游字段)。见 [docs/architecture/protocol-encoding.md](docs/architecture/protocol-encoding.md#schema-conformance-lint)。
 
@@ -135,7 +135,7 @@ CGO_ENABLED=1 go test -timeout=30s ./...
 MUMBLE_MUMBLE_PORT=64738 MUMBLE_REST_PORT=64730 ./go-mumble-server
 ```
 
-同一个二进制支持三种运行方式:默认的 `standalone` 适合单机部署;`core` 在保留本地服务的同时接受远端 Edge;`edge` 只负责客户端 TCP/TLS、UDP 和 Core 接入,不打开本地数据库。Core 与 Edge 之间使用 mTLS,Edge 断线后会自动重连。小型服务器无需改变部署方式,后续可按需增加 Edge 以获得更灵活的接入和横向扩展能力。详见 [Core / Edge 部署说明](docs/core-edge-deployment.md)。
+同一个二进制支持三种运行方式:默认的 `standalone` 适合单机部署;`core` 在保留本地服务的同时接受远端 Edge;`edge` 只负责客户端 TCP/TLS、UDP 和 Core 接入,不打开本地数据库。Core 与 Edge 之间使用 mTLS,Edge 断线后会自动重连。小型服务器无需改变部署方式,后续可按需增加 Edge 以获得更灵活的接入和横向扩展能力。详见 [Core / Edge 部署说明](docs/guides/core-edge-deployment.md)。
 
 ## Docker 部署
 
@@ -238,13 +238,13 @@ volumes:
 | 频道嵌套上限 | 10 | 最大频道树深度 |
 | 频道数量上限 | 1000 | 最大频道总数 |
 
-完整配置参考见 [docs/technical-overview.md](docs/technical-overview.md)。
+参见[启动配置示例](configs/mumble-server.toml)和[运行与启动说明](docs/architecture/runtime-and-startup.md)。
 
 ### 外部身份提供者
 
 `[auth].mode` 默认为 `local`,保持本地 registered user、密码和证书登录兼容。设为 `external` 后,协议层只通过 External HTTP Identity Provider 完成认证和稳定 ID↔名称查询;provider 的 `deny` 会拒绝登录,超时、5xx 或无效响应同样 fail closed,绝不会回退到本地账户。
 
-提供者的认证与目录 endpoint 分别由 `authenticate_path` 和 `resolve_path` 配置,默认采用 `/api/internal/mumble/v1/...`,可适配其它 HTTP 身份系统而无需修改核心代码。认证响应必须给出非零 stable user ID、canonical name 和可选的权威运行时组。客户端 access token 与权威组分别保存,权威组不持久化到 SQLite;在线会话会按 `revalidate_interval_seconds` 重验,并受 `stale_grace_seconds` 约束。详见[外部身份提供者接入文档](docs/fuxi-seat-external-identity.md)。
+提供者的认证与目录 endpoint 分别由 `authenticate_path` 和 `resolve_path` 配置,默认采用 `/api/internal/mumble/v1/...`,可适配其它 HTTP 身份系统而无需修改核心代码。认证响应必须给出非零 stable user ID、canonical name 和可选的权威运行时组。客户端 access token 与权威组分别保存,权威组不持久化到 SQLite;在线会话会按 `revalidate_interval_seconds` 重验,并受 `stale_grace_seconds` 约束。详见[外部身份提供者接入文档](docs/guides/fuxi-seat-external-identity.md)。
 
 ## Web 管理界面
 
@@ -252,13 +252,13 @@ volumes:
 
 功能:服务器状态仪表板、频道树管理、已连接用户列表、ACL 编辑器、封禁列表管理、服务器配置和虚拟服务器控制。
 
-管理员、频道 ACL、`local`/`external` 身份模式和频道链接的操作说明见[管理员与频道权限说明](docs/permissions-and-admin-guide.md)。
+管理员、频道 ACL、`local`/`external` 身份模式和频道链接的操作说明见[管理员与频道权限说明](docs/guides/permissions-and-admin-guide.md)。
 
 可通过 `-frontend-embed=false` 在运行时禁用前端,适用于 headless/仅 API 部署。
 
 ## REST API
 
-管理 API 默认运行在端口 64730(可通过配置中的 `rest_port` 或 `MUMBLE_REST_PORT` 修改)。交互式 Swagger 文档位于 `/docs`。Web 界面即为此 REST API 的消费者。关于使用 HTTPS 和 TLS 终止的生产部署,见[使用 Caddy 部署](docs/deployment-caddy.md)。
+管理 API 默认运行在端口 64730(可通过配置中的 `rest_port` 或 `MUMBLE_REST_PORT` 修改)。交互式 Swagger 文档位于 `/docs`。Web 界面即为此 REST API 的消费者。关于使用 HTTPS 和 TLS 终止的生产部署,见[使用 Caddy 部署](docs/guides/deployment-caddy.md)。
 
 ```bash
 # 服务器健康状态
@@ -323,7 +323,7 @@ for {
 
 **协议策略:** 不使用 Google protobuf。见 [docs/architecture/protocol-encoding.md](docs/architecture/protocol-encoding.md)。连接管理和处理器逻辑由你的代码提供。
 
-完整的包布局和库/服务器边界见 [docs/technical-overview.md](docs/technical-overview.md)。
+包布局和协议库／服务端边界见[模块地图](docs/architecture/module-map.md)。
 
 ## 本地开发
 
@@ -411,35 +411,7 @@ go-mumble-server/
 
 ## 文档
 
-### 核心
-
-- [产品概述](docs/product-overview.md) —— 项目愿景与功能摘要
-- [技术概述](docs/technical-overview.md) —— 架构、子系统和设计决策
-- [Core / Edge 部署说明](docs/core-edge-deployment.md) —— 三种运行模式、mTLS 证书和多节点部署
-- [使用 Caddy 部署](docs/deployment-caddy.md) —— 反向代理设置(生产环境推荐)
-
-### 协议
-
-- [控制消息](docs/protocol/control-messages.md) —— TCP 消息目录(类型 0–26)
-- [协议编码](docs/architecture/protocol-encoding.md) —— 原生 Go 线缆编码、proto2 字段存在性、快照与增量回显规则、schema 一致性检查
-- [语音数据](docs/protocol/voice-data.md) —— UDP 音频封包格式与路由
-- [安全模式](docs/protocol/security-modes.md) —— 逐客户端加密层级(legacy、secure、lite)与混合模式强制
-- [加密](docs/protocol/encryption.md) —— TLS、AEAD 密码、密码哈希
-- [权限](docs/protocol/permissions.md) —— 权限位掩码定义
-
-### 前端
-
-- [前端指南](docs/patterns/frontend-guide.md) —— Vue 3 与 Vuetify 约定
-- [UI 样式指南](docs/patterns/ui-style-guidelines.md) —— 视觉设计规范
-
-### 模式
-
-- [连接生命周期](docs/patterns/connection-lifecycle-pattern.md) —— 从客户端连接到断开
-- [处理器表](docs/patterns/handler-table-pattern.md) —— 按类型 ID 分发消息
-- [频道树](docs/patterns/channel-tree-pattern.md) —— 层级化频道管理
-- [音频流水线](docs/patterns/audio-pipeline-pattern.md) —— 语音路由与转发
-- [ACL 求值](docs/patterns/acl-evaluation-pattern.md) —— 权限解析算法
-- [并发状态](docs/patterns/concurrent-state-pattern.md) —— goroutine 安全的共享状态
+从[项目文档索引](docs/README.md)查阅架构、接口契约、操作指南与工程规范。运行中的管理 API 在 `/docs` 单独提供 Swagger。
 
 ## 测试客户端
 
@@ -459,7 +431,7 @@ go-mumble-server 兼容任何实现标准 Mumble 协议的客户端:
 - Plumble 及其他基于 Humla 的 Android 客户端
 - 基于 `pkg/mumble/` 构建的自定义 Go 客户端
 
-Murmur 快照与增量回显规则及 Humla 禁言语义见 [docs/features/0007-userstate-field-presence.md](docs/features/0007-userstate-field-presence.md),与之配套的授权规则、内容限制和录制策略见 [0008](docs/features/0008-userstate-authorization-and-limits.md)。
+Murmur 快照与增量回显规则及 Humla 禁言语义见 [UserState 字段存在性](docs/features/current/0007-userstate-field-presence.md),与之配套的授权规则、内容限制和录制策略见 [0008](docs/features/current/0008-userstate-authorization-and-limits.md)。
 
 ## 许可证
 

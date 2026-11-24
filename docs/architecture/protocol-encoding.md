@@ -1,3 +1,13 @@
+---
+status: active
+doc_type: architecture
+owner: maintainers
+last_reviewed: 2026-11-24
+source_of_truth:
+  - pkg/mumble/protocol/messages/
+  - pkg/mumble/protocol/wire/
+---
+
 # Protocol Encoding
 
 > **Do not use Google protobuf.** This project uses native Go structs and hand-written wire encoding for all Mumble protocol messages.
@@ -18,7 +28,7 @@ go-mumble-server implements the Mumble protocol **without** `google.golang.org/p
 - A field that has been *assigned* is written to the wire even when its value is the type default. `set_self_mute(false)` produces bytes.
 - "Absent" and "false" are therefore **different states**. Absent means "unchanged / unknown"; `false` means "definitively off".
 
-A proto3-style `if value != default { write }` encoder silently collapses these two states, and the resulting bug is subtle: it only affects peers that interpret absence as "no information". Real clients differ here. The official Mumble client applies its own mute state locally before telling the server, so it never notices. Mumla and Plumble derive their mute state from the server's echo, so a dropped `self_mute=false` leaves them muted with no way to recover. See [0007-userstate-field-presence.md](../features/0007-userstate-field-presence.md).
+A proto3-style `if value != default { write }` encoder silently collapses these two states, and the resulting bug is subtle: it only affects peers that interpret absence as "no information". Real clients differ here. The official Mumble client applies its own mute state locally before telling the server, so it never notices. Mumla and Plumble derive their mute state from the server's echo, so a dropped `self_mute=false` leaves them muted with no way to recover. See [0007-userstate-field-presence.md](../features/current/0007-userstate-field-presence.md).
 
 Messages that need presence carry a `SetFields` bitmask of has-bits, used in **both** directions: `Unmarshal` records which fields the peer sent, and `Marshal` uses it to emit explicitly-set defaults. When adding a bool or scalar to a message where "explicitly off" is meaningful, give it a has-bit rather than relying on the zero value.
 
@@ -36,7 +46,7 @@ optimistically update), so an unmute echo must carry explicit `self_mute`/
 `self_deaf` presence — but they do **not** rebroadcast the server's full
 `UserState`, and over-broadcast admin `false` flags do not cause them to send
 `PermissionDenied`-triggering fields. See
-[0007-userstate-field-presence.md](../features/0007-userstate-field-presence.md).
+[0007-userstate-field-presence.md](../features/current/0007-userstate-field-presence.md).
 
 Murmur's actual rule, which this server now follows for `UserState`:
 
@@ -53,7 +63,7 @@ This same distinction generalizes to every message that echoes client input:
 prefer emitting the minimal delta a real Murmur would emit over broadcasting a
 full state dump, even when a full dump would be easier to write. See
 [control-messages.md](../protocol/control-messages.md#type-9--userstate) and
-[0007-userstate-field-presence.md](../features/0007-userstate-field-presence.md).
+[0007-userstate-field-presence.md](../features/current/0007-userstate-field-presence.md).
 
 ## Schema conformance lint
 
